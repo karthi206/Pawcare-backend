@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+uploads/*
+instance/
+*.db
+.env
+data/
+export/
+*.pkl
+model/confusion_matrix.png
