@@ -15,8 +15,11 @@ import os
 
 
 app = Flask(__name__)
-CORS(app)
-
+CORS(app, origins=[
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+    "https://pawcare-frontend-azure.vercel.app"
+])
 # Database configuration
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///cases.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
