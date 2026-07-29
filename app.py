@@ -66,7 +66,7 @@ def upload():
         }), 422
 
     location = request.form.get('location')
-    result = predict_image(model, filepath)
+    result = predict_image(model, filepath, use_tta=False)
     is_uncertain = result["confidence"] < CONFIDENCE_THRESHOLD
 
     new_case = Case(
