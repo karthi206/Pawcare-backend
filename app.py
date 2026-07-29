@@ -33,7 +33,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Load the trained CNN model ONCE when the server starts
 model = load_model('model/pawcare_model.pth')
-general_model = load_general_model()  # loaded once at startup, used only for the dog-detection gate
+# general_model = load_general_model()  # Temporarily disabled - too memory-intensive for free tier hosting
 CONFIDENCE_THRESHOLD = 0.60
 
 
@@ -58,12 +58,12 @@ def upload():
     filepath = os.path.join(UPLOAD_FOLDER, unique_filename)
     file.save(filepath)
 
-    # Gate: reject images that don't appear to contain a dog at all
-    if not is_likely_dog(general_model, filepath):
-        return jsonify({
-            "error": "no_dog_detected",
-            "message": "This doesn't appear to be a photo of a dog. Please upload a clear photo of the affected area."
-        }), 422
+   # Gate temporarily disabled - too memory-intensive for free tier hosting
+    # if not is_likely_dog(general_model, filepath):
+    #     return jsonify({
+    #         "error": "no_dog_detected",
+    #         "message": "This doesn't appear to be a photo of a dog. Please upload a clear photo of the affected area."
+    #     }), 422
 
     location = request.form.get('location')
     result = predict_image(model, filepath, use_tta=False)
