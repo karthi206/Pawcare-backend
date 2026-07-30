@@ -33,7 +33,7 @@ UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Load the trained CNN model ONCE when the server starts
-model = load_model('model/pawcare_model.pth')
+model = load_model('model/pawcare_model.onnx')
 # general_model = load_general_model()  # Temporarily disabled - too memory-intensive for free tier hosting
 CONFIDENCE_THRESHOLD = 0.60
 
