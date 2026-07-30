@@ -62,3 +62,64 @@ class User(db.Model):
             "clinic_address": self.clinic_address,
             "is_verified": self.is_verified,
         }
+class NGO(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(200), nullable=False)
+    phone = db.Column(db.String(50), nullable=False)
+    address = db.Column(db.String(300), nullable=False)
+    lat = db.Column(db.Float, nullable=False)
+    lng = db.Column(db.Float, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id, "name": self.name, "phone": self.phone,
+            "address": self.address, "lat": self.lat, "lng": self.lng
+        }
+
+
+class NGONotification(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    ngo_id = db.Column(db.Integer, db.ForeignKey('ngo.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    message = db.Column(db.String(500), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id, "ngo_id": self.ngo_id, "user_id": self.user_id,
+            "message": self.message, "created_at": self.created_at.isoformat()
+        }
+
+
+class Pet(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    breed = db.Column(db.String(100), nullable=True)
+    age = db.Column(db.String(50), nullable=True)
+    description = db.Column(db.String(500), nullable=True)
+    image_filename = db.Column(db.String(255), nullable=True)
+    is_vaccinated = db.Column(db.Boolean, default=False)
+    status = db.Column(db.String(20), default="available")  # 'available' or 'adopted'
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id, "name": self.name, "breed": self.breed, "age": self.age,
+            "description": self.description, "image_filename": self.image_filename,
+            "is_vaccinated": self.is_vaccinated, "status": self.status
+        }
+
+
+class AdoptionRequest(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    pet_id = db.Column(db.Integer, db.ForeignKey('pet.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    status = db.Column(db.String(20), default="pending")  # pending, contacted, completed
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id, "pet_id": self.pet_id, "user_id": self.user_id,
+            "status": self.status, "created_at": self.created_at.isoformat()
+        }

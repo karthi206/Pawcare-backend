@@ -6,6 +6,7 @@ from clustering import detect_clusters
 import uuid
 from werkzeug.utils import secure_filename
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from models import db, Case, User, NGO, NGONotification, Pet, AdoptionRequest
 
 # Let Flask find files inside model/ - must come BEFORE importing from it
 sys.path.append(os.path.join(os.path.dirname(__file__), 'model'))
@@ -259,6 +260,85 @@ def reject_vet(vet_id):
     db.session.delete(vet)
     db.session.commit()
     return jsonify({"message": f"{vet.username}'s application was rejected and removed"})
+from models import db, Case, User, NGO, NGONotification, Pet, AdoptionRequest
+
+@app.route('/ngos', methods=['GET'])
+def get_ngos():
+    ngos = NGO.query.all()
+    return jsonify([n.to_dict() for n in ngos])
+
+
+@app.route('/ngos', methods=['POST'])
+@jwt_required()
+def create_ngo():
+    admin = require_admin()
+    if not admin:
+        return jsonify({"error": "Admin access required"}), 403
+
+    data = request.json
+    new_ngo = NGO(
+        name=data.get('name'), phone=data.get('phone'),
+        address=data.get('address'), lat=data.get('lat'), lng=data.get('lng')
+    )
+    db.session.add(new_ngo)
+    db.session.commit()
+    return jsonify(new_ngo.to_dict()), 201
+
+
+@app.route('/ngos/<int:ngo_id>/notify', methods=['POST'])
+@jwt_required()
+def notify_ngo(ngo_id):
+    user_id = get_jwt_identity()
+    ngo = NGO.query.get(ngo_id)
+    if not ngo:
+        return jsonify({"error": "NGO not found"}), 404
+
+    data = request.json or {}
+    notification = NGONotification(ngo_id=ngo_id, user_id=int(user_id), message=data.get('message'))
+    db.session.add(notification)
+    db.session.commit()
+    return jsonify({"message": f"{ngo.name} has been notified"}), 201
+
+
+@app.route('/pets', methods=['GET'])
+def get_pets():
+    pets = Pet.query.filter_by(status='available').all()
+    return jsonify([p.to_dict() for p in pets])
+
+
+@app.route('/pets', methods=['POST'])
+@jwt_required()
+def create_pet():
+    admin = require_admin()
+    if not admin:
+        return jsonify({"error": "Admin access required"}), 403
+
+    data = request.json
+    new_pet = Pet(
+        name=data.get('name'), breed=data.get('breed'), age=data.get('age'),
+        description=data.get('description'), is_vaccinated=data.get('is_vaccinated', False)
+    )
+    db.session.add(new_pet)
+    db.session.commit()
+    return jsonify(new_pet.to_dict()), 201
+
+
+@app.route('/pets/<int:pet_id>/adopt', methods=['POST'])
+@jwt_required()
+def request_adoption(pet_id):
+    user_id = get_jwt_identity()
+    pet = Pet.query.get(pet_id)
+    if not pet:
+        return jsonify({"error": "Pet not found"}), 404
+
+    existing = AdoptionRequest.query.filter_by(pet_id=pet_id, user_id=int(user_id)).first()
+    if existing:
+        return jsonify({"error": "You've already requested to adopt this pet"}), 409
+
+    new_request = AdoptionRequest(pet_id=pet_id, user_id=int(user_id))
+    db.session.add(new_request)
+    db.session.commit()
+    return jsonify({"message": f"Adoption request for {pet.name} submitted"}), 201
 
 
 if __name__ == '__main__':
