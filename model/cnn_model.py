@@ -23,12 +23,14 @@ def load_model(weights_path):
     return session
 
 
-def load_general_model():
+def load_general_model(weights_path="model/general_imagenet_model.onnx"):
     """
-    Dog-detection gate is disabled for memory reasons (as before).
-    Kept as a no-op so existing imports in app.py don't break.
+    Loads the ONNX version of the pretrained ImageNet MobileNetV2,
+    used only to check "is this actually a dog?" before running the
+    disease model. Much lighter than the old PyTorch version.
     """
-    return None
+    session = ort.InferenceSession(weights_path, providers=["CPUExecutionProvider"])
+    return session
 
 
 def _preprocess(image_path):
@@ -49,8 +51,18 @@ def _softmax(x):
 
 
 def is_likely_dog(general_model, image_path):
-    """Disabled — always returns True so nothing blocks uploads. Kept for interface compatibility."""
-    return True
+    """
+    Returns True if the image is likely to contain a dog, based on the
+    ImageNet-pretrained model's dog-breed class probabilities.
+    'general_model' is the onnxruntime session from load_general_model().
+    """
+    input_array = _preprocess(image_path)
+    outputs = general_model.run(None, {"input": input_array})[0][0]
+    probabilities = _softmax(outputs)
+
+    dog_probability_mass = float(sum(probabilities[i] for i in DOG_CLASS_RANGE))
+    print(f"DEBUG: dog_probability_mass = {dog_probability_mass:.4f}")
+    return dog_probability_mass >= DOG_CONFIDENCE_THRESHOLD
 
 
 def predict_image(session, image_path, use_tta=False):
