@@ -11,9 +11,6 @@ from models import db, Case, User, NGO, NGONotification, Pet, AdoptionRequest
 # Let Flask find files inside model/ - must come BEFORE importing from it
 sys.path.append(os.path.join(os.path.dirname(__file__), 'model'))
 from cnn_model import load_model, predict_image, load_general_model, is_likely_dog
-from models import db, Case, User
-import os
-
 
 app = Flask(__name__)
 CORS(app, origins=[
@@ -21,6 +18,7 @@ CORS(app, origins=[
     "http://localhost:5173",
     "https://pawcare-frontend-azure.vercel.app"
 ])
+
 # Database configuration
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///cases.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -96,12 +94,14 @@ def upload():
 
 
 @app.route('/cases', methods=['GET'])
+@jwt_required()
 def get_cases():
     cases = Case.query.order_by(Case.created_at.desc()).all()
     return jsonify([case.to_dict() for case in cases])
 
 
 @app.route('/cases/<int:case_id>', methods=['GET'])
+@jwt_required()
 def get_case(case_id):
     case = Case.query.get(case_id)
     if not case:
@@ -110,6 +110,7 @@ def get_case(case_id):
 
 
 @app.route('/clusters', methods=['GET'])
+@jwt_required()
 def get_clusters():
     all_cases = Case.query.all()
     cases_as_dicts = [c.to_dict() for c in all_cases]
@@ -209,6 +210,8 @@ def update_case_status(case_id):
 
     db.session.commit()
     return jsonify(case.to_dict())
+
+
 def require_admin():
     """Helper: returns the current user if they're an admin, otherwise None."""
     user_id = get_jwt_identity()
@@ -259,9 +262,10 @@ def reject_vet(vet_id):
     db.session.delete(vet)
     db.session.commit()
     return jsonify({"message": f"{vet.username}'s application was rejected and removed"})
-from models import db, Case, User, NGO, NGONotification, Pet, AdoptionRequest
+
 
 @app.route('/ngos', methods=['GET'])
+@jwt_required()
 def get_ngos():
     ngos = NGO.query.all()
     return jsonify([n.to_dict() for n in ngos])
@@ -300,6 +304,7 @@ def notify_ngo(ngo_id):
 
 
 @app.route('/pets', methods=['GET'])
+@jwt_required()
 def get_pets():
     pets = Pet.query.filter_by(status='available').all()
     return jsonify([p.to_dict() for p in pets])
@@ -338,34 +343,6 @@ def request_adoption(pet_id):
     db.session.add(new_request)
     db.session.commit()
     return jsonify({"message": f"Adoption request for {pet.name} submitted"}), 201
-@app.route('/cases', methods=['GET'])
-@jwt_required()
-def get_cases():
-    cases = Case.query.order_by(Case.created_at.desc()).all()
-    return jsonify([case.to_dict() for case in cases])
-
-
-@app.route('/clusters', methods=['GET'])
-@jwt_required()
-def get_clusters():
-    all_cases = Case.query.all()
-    cases_as_dicts = [c.to_dict() for c in all_cases]
-    clusters = detect_clusters(cases_as_dicts)
-    return jsonify(clusters)
-
-
-@app.route('/ngos', methods=['GET'])
-@jwt_required()
-def get_ngos():
-    ngos = NGO.query.all()
-    return jsonify([n.to_dict() for n in ngos])
-
-
-@app.route('/pets', methods=['GET'])
-@jwt_required()
-def get_pets():
-    pets = Pet.query.filter_by(status='available').all()
-    return jsonify([p.to_dict() for p in pets])
 
 
 if __name__ == '__main__':
