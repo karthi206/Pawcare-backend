@@ -338,6 +338,34 @@ def request_adoption(pet_id):
     db.session.add(new_request)
     db.session.commit()
     return jsonify({"message": f"Adoption request for {pet.name} submitted"}), 201
+@app.route('/cases', methods=['GET'])
+@jwt_required()
+def get_cases():
+    cases = Case.query.order_by(Case.created_at.desc()).all()
+    return jsonify([case.to_dict() for case in cases])
+
+
+@app.route('/clusters', methods=['GET'])
+@jwt_required()
+def get_clusters():
+    all_cases = Case.query.all()
+    cases_as_dicts = [c.to_dict() for c in all_cases]
+    clusters = detect_clusters(cases_as_dicts)
+    return jsonify(clusters)
+
+
+@app.route('/ngos', methods=['GET'])
+@jwt_required()
+def get_ngos():
+    ngos = NGO.query.all()
+    return jsonify([n.to_dict() for n in ngos])
+
+
+@app.route('/pets', methods=['GET'])
+@jwt_required()
+def get_pets():
+    pets = Pet.query.filter_by(status='available').all()
+    return jsonify([p.to_dict() for p in pets])
 
 
 if __name__ == '__main__':
