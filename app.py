@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 import os
 import sys
 from flask_cors import CORS
@@ -11,6 +11,9 @@ from models import db, Case, User, NGO, NGONotification, Pet, AdoptionRequest
 # Let Flask find files inside model/ - must come BEFORE importing from it
 sys.path.append(os.path.join(os.path.dirname(__file__), 'model'))
 from cnn_model import load_model, predict_image, load_general_model, is_likely_dog
+from models import db, Case, User
+import os
+
 
 app = Flask(__name__)
 CORS(app, origins=[
@@ -18,7 +21,6 @@ CORS(app, origins=[
     "http://localhost:5173",
     "https://pawcare-frontend-azure.vercel.app"
 ])
-
 # Database configuration
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///cases.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -93,15 +95,24 @@ def upload():
     })
 
 
+@app.route('/uploads/<filename>', methods=['GET'])
+def serve_upload(filename):
+    """
+    Serves an uploaded case photo so vets (and the frontend) can view it.
+    'filename' here is the UUID-based filename stored on Case.filename —
+    NOT a user-supplied path, so this is safe from path traversal.
+    """
+    safe_filename = secure_filename(filename)
+    return send_from_directory(UPLOAD_FOLDER, safe_filename)
+
+
 @app.route('/cases', methods=['GET'])
-@jwt_required()
 def get_cases():
     cases = Case.query.order_by(Case.created_at.desc()).all()
     return jsonify([case.to_dict() for case in cases])
 
 
 @app.route('/cases/<int:case_id>', methods=['GET'])
-@jwt_required()
 def get_case(case_id):
     case = Case.query.get(case_id)
     if not case:
@@ -110,12 +121,41 @@ def get_case(case_id):
 
 
 @app.route('/clusters', methods=['GET'])
-@jwt_required()
 def get_clusters():
     all_cases = Case.query.all()
     cases_as_dicts = [c.to_dict() for c in all_cases]
     clusters = detect_clusters(cases_as_dicts)
     return jsonify(clusters)
+
+
+@app.route('/setup/make-admin', methods=['POST'])
+def make_admin():
+    """
+    One-time setup route to promote an existing user to admin.
+    Protected by a secret key (set as ADMIN_SETUP_KEY in Render's
+    environment variables) so random people can't call this.
+
+    Usage: POST with JSON body { "username": "...", "setup_key": "..." }
+    Recommended: delete this route (or unset ADMIN_SETUP_KEY) once
+    you've created your admin account.
+    """
+    setup_key = os.environ.get('ADMIN_SETUP_KEY')
+    if not setup_key:
+        return jsonify({"error": "Admin setup is disabled (ADMIN_SETUP_KEY not configured)"}), 403
+
+    data = request.json or {}
+    if data.get('setup_key') != setup_key:
+        return jsonify({"error": "Invalid setup key"}), 403
+
+    username = data.get('username')
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        return jsonify({"error": "User not found — register a normal account first, then promote it"}), 404
+
+    user.role = 'admin'
+    user.is_verified = True
+    db.session.commit()
+    return jsonify({"message": f"{user.username} is now an admin", "user": user.to_dict()})
 
 
 @app.route('/auth/register', methods=['POST'])
@@ -210,8 +250,6 @@ def update_case_status(case_id):
 
     db.session.commit()
     return jsonify(case.to_dict())
-
-
 def require_admin():
     """Helper: returns the current user if they're an admin, otherwise None."""
     user_id = get_jwt_identity()
@@ -262,10 +300,46 @@ def reject_vet(vet_id):
     db.session.delete(vet)
     db.session.commit()
     return jsonify({"message": f"{vet.username}'s application was rejected and removed"})
+from models import db, Case, User, NGO, NGONotification, Pet, AdoptionRequest
+
+@app.route('/admin/export-corrections', methods=['GET'])
+@jwt_required()
+def export_corrections():
+    """
+    Human-in-the-loop export: returns every case where a vet has
+    confirmed/corrected the AI's prediction. Use this list to pull
+    the actual image files (via /uploads/<filename>) and retrain
+    the model in Colab with the vet-confirmed labels.
+    """
+    admin = require_admin()
+    if not admin:
+        return jsonify({"error": "Admin access required"}), 403
+
+    corrected_cases = Case.query.filter(Case.vet_confirmed_label.isnot(None)).all()
+
+    export_data = []
+    for case in corrected_cases:
+        export_data.append({
+            "case_id": case.id,
+            "image_url": f"/uploads/{case.filename}",
+            "ai_prediction": case.prediction,
+            "ai_confidence": case.confidence,
+            "vet_confirmed_label": case.vet_confirmed_label,
+            "ai_was_correct": case.prediction == case.vet_confirmed_label,
+            "reviewed_by_id": case.reviewed_by_id,
+        })
+
+    agreement_count = sum(1 for c in export_data if c["ai_was_correct"])
+    total = len(export_data)
+
+    return jsonify({
+        "total_vet_reviewed_cases": total,
+        "ai_agreement_rate": round(agreement_count / total, 3) if total > 0 else None,
+        "cases": export_data
+    })
 
 
 @app.route('/ngos', methods=['GET'])
-@jwt_required()
 def get_ngos():
     ngos = NGO.query.all()
     return jsonify([n.to_dict() for n in ngos])
@@ -304,7 +378,6 @@ def notify_ngo(ngo_id):
 
 
 @app.route('/pets', methods=['GET'])
-@jwt_required()
 def get_pets():
     pets = Pet.query.filter_by(status='available').all()
     return jsonify([p.to_dict() for p in pets])
