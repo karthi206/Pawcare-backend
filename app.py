@@ -41,6 +41,41 @@ CONFIDENCE_THRESHOLD = 0.60
 with app.app_context():
     db.create_all()
 
+    # ── PERMANENT ADMIN AUTO-SEED ──────────────────────────────────────
+    # Render's free tier wipes the database on every redeploy. Instead of
+    # manually re-promoting yourself to admin every time, this block runs
+    # on EVERY startup and guarantees your admin account exists — using
+    # the username/password/PIN you set once in Render's Environment tab.
+    FIXED_ADMIN_USERNAME = os.environ.get('FIXED_ADMIN_USERNAME')
+    FIXED_ADMIN_PASSWORD = os.environ.get('FIXED_ADMIN_PASSWORD')
+    FIXED_ADMIN_EMAIL = os.environ.get('FIXED_ADMIN_EMAIL', 'admin@pawcare.local')
+
+    if FIXED_ADMIN_USERNAME and FIXED_ADMIN_PASSWORD:
+        existing_admin = User.query.filter_by(username=FIXED_ADMIN_USERNAME).first()
+        if not existing_admin:
+            new_admin = User(
+                username=FIXED_ADMIN_USERNAME,
+                email=FIXED_ADMIN_EMAIL,
+                role='admin',
+                is_verified=True,
+            )
+            new_admin.set_password(FIXED_ADMIN_PASSWORD)
+            db.session.add(new_admin)
+            db.session.commit()
+            print(f"[startup] Created permanent admin account: {FIXED_ADMIN_USERNAME}")
+        elif existing_admin.role != 'admin':
+            # Covers the case where the database survived but this account
+            # somehow isn't admin — self-heals instead of silently staying broken.
+            existing_admin.role = 'admin'
+            existing_admin.is_verified = True
+            db.session.commit()
+            print(f"[startup] Promoted existing account to admin: {FIXED_ADMIN_USERNAME}")
+        else:
+            print(f"[startup] Admin account already exists: {FIXED_ADMIN_USERNAME}")
+    else:
+        print("[startup] FIXED_ADMIN_USERNAME / FIXED_ADMIN_PASSWORD not set — skipping admin auto-seed.")
+    # ─────────────────────────────────────────────────────────────────────
+
 
 @app.route('/')
 def home():
