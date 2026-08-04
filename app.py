@@ -332,9 +332,14 @@ def reject_vet(vet_id):
     if not vet or vet.role != 'vet':
         return jsonify({"error": "Vet not found"}), 404
 
-    db.session.delete(vet)
+    # CHANGED: previously this used db.session.delete(vet), which permanently erased the
+    # account (username, email, password) entirely. Now the account is preserved — it's
+    # downgraded to a regular 'user' instead, so the person can still log in and use the
+    # app normally, they just lose vet privileges. Nothing about their login is destroyed.
+    vet.role = 'user'
+    vet.is_verified = False
     db.session.commit()
-    return jsonify({"message": f"{vet.username}'s application was rejected and removed"})
+    return jsonify({"message": f"{vet.username}'s vet application was rejected. Their account remains active as a regular user."})
 from models import db, Case, User, NGO, NGONotification, Pet, AdoptionRequest
 
 @app.route('/admin/export-corrections', methods=['GET'])
@@ -425,10 +430,27 @@ def create_pet():
     if not admin:
         return jsonify({"error": "Admin access required"}), 403
 
-    data = request.json
+    # Supports multipart/form-data (with an optional photo) instead of only JSON,
+    # so admins can attach a real photo when adding a pet for adoption.
+    data = request.form if request.form else (request.json or {})
+
+    image_filename = None
+    if 'image' in request.files and request.files['image'].filename:
+        file = request.files['image']
+        original_filename = secure_filename(file.filename)
+        extension = os.path.splitext(original_filename)[1]
+        image_filename = f"{uuid.uuid4().hex}{extension}"
+        filepath = os.path.join(UPLOAD_FOLDER, image_filename)
+        file.save(filepath)
+
+    is_vaccinated_raw = data.get('is_vaccinated', False)
+    # Form data arrives as a string ("true"/"false"), JSON arrives as a real bool — handle both.
+    is_vaccinated = is_vaccinated_raw in (True, 'true', 'True', '1', 1)
+
     new_pet = Pet(
         name=data.get('name'), breed=data.get('breed'), age=data.get('age'),
-        description=data.get('description'), is_vaccinated=data.get('is_vaccinated', False)
+        description=data.get('description'), is_vaccinated=is_vaccinated,
+        image_filename=image_filename,
     )
     db.session.add(new_pet)
     db.session.commit()
