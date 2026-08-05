@@ -22,7 +22,16 @@ CORS(app, origins=[
     "https://pawcare-frontend-azure.vercel.app"
 ])
 # Database configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///cases.db'
+# Uses a real, persistent Postgres database (e.g. Neon) when DATABASE_URL is set in
+# Render's environment variables — falls back to the old local SQLite file only if it
+# isn't set, so nothing breaks for local development.
+database_url = os.environ.get('DATABASE_URL', 'sqlite:///cases.db')
+# Some providers (Neon, Heroku-style) give a URL starting with "postgres://", but
+# SQLAlchemy 1.4+ requires "postgresql://" — this translates it automatically so you
+# don't have to remember to edit the URL by hand.
+if database_url.startswith('postgres://'):
+    database_url = database_url.replace('postgres://', 'postgresql://', 1)
+app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(app)
 
