@@ -93,15 +93,17 @@ class NGONotification(db.Model):
 
 
 class Pet(db.Model):
+    __tablename__ = 'pet'
+    
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
-    breed = db.Column(db.String(100), nullable=True)
-    age = db.Column(db.String(50), nullable=True)
-    description = db.Column(db.String(500), nullable=True)
-    image_filename = db.Column(db.String(255), nullable=True)
-    is_vaccinated = db.Column(db.Boolean, default=False)
-    status = db.Column(db.String(20), default="available")  # 'available' or 'adopted'
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    breed = db.Column(db.String(100))
+    age = db.Column(db.String(50))
+    description = db.Column(db.String(500))
+    image_filename = db.Column(db.String(255))
+    is_vaccinated = db.Column(db.Boolean)
+    status = db.Column(db.String(20))  # <-- PROBABLY MISSING DEFAULT
+    created_at = db.Column(db.DateTime)  # <-- PROBABLY MISSING DEFAULT
 
     def to_dict(self):
         return {

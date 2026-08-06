@@ -457,10 +457,15 @@ def create_pet():
     is_vaccinated = is_vaccinated_raw in (True, 'true', 'True', '1', 1)
 
     new_pet = Pet(
-        name=data.get('name'), breed=data.get('breed'), age=data.get('age'),
-        description=data.get('description'), is_vaccinated=is_vaccinated,
-        image_filename=image_filename,
-    )
+    name=data.get('name'),  # Make sure this is sent from frontend
+    breed=data.get('breed'),
+    age=data.get('age'),
+    description=data.get('description'),
+    is_vaccinated=is_vaccinated,
+    image_filename=image_filename,
+    status=data.get('status', 'active'),  # Add default status
+    created_at=datetime.utcnow(),  # Add timestamp
+)
     db.session.add(new_pet)
     db.session.commit()
     return jsonify(new_pet.to_dict()), 201
