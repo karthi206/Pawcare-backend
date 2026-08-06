@@ -463,7 +463,7 @@ def create_pet():
     description=data.get('description'),
     is_vaccinated=is_vaccinated,
     image_filename=image_filename,
-    status=data.get('status', 'active'),  # Add default status
+    status=data.get('status', 'available'),  # Match the GET filter
     created_at=datetime.utcnow(),  # Add timestamp
 )
     db.session.add(new_pet)
