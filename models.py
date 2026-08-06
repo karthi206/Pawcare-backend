@@ -102,7 +102,8 @@ class Pet(db.Model):
     description = db.Column(db.String(500))
     image_filename = db.Column(db.String(255))
     is_vaccinated = db.Column(db.Boolean)
-    status = db.Column(db.String(20))  # <-- PROBABLY MISSING DEFAULT
+    status = db.Column(db.String(20), default='available')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
     created_at = db.Column(db.DateTime)  # <-- PROBABLY MISSING DEFAULT
 
     def to_dict(self):
