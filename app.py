@@ -7,7 +7,7 @@ import uuid
 from werkzeug.utils import secure_filename
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from models import db, Case, User, NGO, NGONotification, Pet, AdoptionRequest
-
+from datetime import datetime
 # Let Flask find files inside model/ - must come BEFORE importing from it
 sys.path.append(os.path.join(os.path.dirname(__file__), 'model'))
 from cnn_model import load_model, predict_image, load_general_model, is_likely_dog
