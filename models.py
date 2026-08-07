@@ -109,7 +109,7 @@ class Pet(db.Model):
     def to_dict(self):
         return {
             "id": self.id, "name": self.name, "breed": self.breed, "age": self.age,
-            "description": self.description, "image_filename": self.image_filename,
+            "description": self.description, "image_filename": self.image_filename,"image_filename": self.image_filename,
             "is_vaccinated": self.is_vaccinated, "status": self.status
         }
 

@@ -13,7 +13,14 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'model'))
 from cnn_model import load_model, predict_image, load_general_model, is_likely_dog
 from models import db, Case, User
 import os
+import cloudinary
+import cloudinary.uploader
 
+cloudinary.config(
+    cloud_name=os.environ.get('CLOUDINARY_CLOUD_NAME'),
+    api_key=os.environ.get('CLOUDINARY_API_KEY'),
+    api_secret=os.environ.get('CLOUDINARY_API_SECRET')
+)
 
 app = Flask(__name__)
 CORS(app, origins=[
@@ -487,6 +494,45 @@ def request_adoption(pet_id):
     db.session.add(new_request)
     db.session.commit()
     return jsonify({"message": f"Adoption request for {pet.name} submitted"}), 201
+@app.route('/pets', methods=['POST'])
+@jwt_required()
+def create_pet():
+    admin = require_admin()
+    if not admin:
+        return jsonify({"error": "Admin access required"}), 403
+
+    data = request.form if request.form else (request.json or {})
+
+    image_url = None
+    if 'image' in request.files and request.files['image'].filename:
+        file = request.files['image']
+        try:
+            # Upload to Cloudinary
+            result = cloudinary.uploader.upload(
+                file,
+                folder='pawcare/pets',  # Organizes uploads into a folder
+                resource_type='auto'
+            )
+            image_url = result['secure_url']
+        except Exception as e:
+            return jsonify({"error": f"Failed to upload image: {str(e)}"}), 400
+
+    is_vaccinated_raw = data.get('is_vaccinated', False)
+    is_vaccinated = is_vaccinated_raw in (True, 'true', 'True', '1', 1)
+
+    new_pet = Pet(
+        name=data.get('name'),
+        breed=data.get('breed'),
+        age=data.get('age'),
+        description=data.get('description'),
+        is_vaccinated=is_vaccinated,
+        image_filename=image_url,  # Now stores the full Cloudinary URL
+        status=data.get('status', 'available'),
+        created_at=datetime.utcnow(),
+    )
+    db.session.add(new_pet)
+    db.session.commit()
+    return jsonify(new_pet.to_dict()), 201
 
 
 if __name__ == '__main__':
