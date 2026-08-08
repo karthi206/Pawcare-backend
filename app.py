@@ -104,20 +104,64 @@ def upload():
         return jsonify({"error": "No image uploaded"}), 400
 
     file = request.files['image']
+    
+    # First check if it's a dog before uploading to Cloudinary
+    # Save temporarily to disk for the dog detection check
     original_filename = secure_filename(file.filename)
     extension = os.path.splitext(original_filename)[1]
-    unique_filename = f"{uuid.uuid4().hex}{extension}"
-    filepath = os.path.join(UPLOAD_FOLDER, unique_filename)
-    file.save(filepath)
-
-    if not is_likely_dog(general_model, filepath):
+    temp_filename = f"{uuid.uuid4().hex}{extension}"
+    temp_filepath = os.path.join(UPLOAD_FOLDER, temp_filename)
+    file.save(temp_filepath)
+    
+    if not is_likely_dog(general_model, temp_filepath):
+        os.remove(temp_filepath)  # Clean up temp file
         return jsonify({
             "error": "no_dog_detected",
             "message": "This doesn't appear to be a photo of a dog. Please upload a clear photo of the affected area."
         }), 422
 
+    # Dog check passed, now upload to Cloudinary
+    try:
+        with open(temp_filepath, 'rb') as f:
+            result = cloudinary.uploader.upload(
+                f,
+                folder='pawcare/cases',  # Separate folder for case photos
+                resource_type='auto'
+            )
+        image_url = result['secure_url']
+        os.remove(temp_filepath)  # Clean up temp file
+    except Exception as e:
+        os.remove(temp_filepath)  # Clean up temp file
+        return jsonify({"error": f"Failed to upload image: {str(e)}"}), 400
+
     location = request.form.get('location')
-    result = predict_image(model, filepath, use_tta=False)
+    result = predict_image(model, image_url, use_tta=False)  # Pass Cloudinary URL instead of filepath
+    is_uncertain = result["confidence"] < CONFIDENCE_THRESHOLD
+
+    new_case = Case(
+        filename=image_url,  # Now stores the full Cloudinary URL
+        prediction=result["prediction"],
+        confidence=result["confidence"],
+        is_uncertain=is_uncertain,
+        location=location
+    )
+    db.session.add(new_case)
+    db.session.commit()
+
+    return jsonify({
+        "case_id": new_case.id,
+        "prediction": result["prediction"],
+        "confidence": round(result["confidence"], 3),
+        "is_uncertain": is_uncertain,
+        "is_ambiguous": result["is_ambiguous"],
+        "second_prediction": result["second_prediction"],
+        "second_confidence": round(result["second_confidence"], 3) if result["second_confidence"] else None,
+        "message": (
+            "Low confidence — recommend in-person veterinary examination."
+            if is_uncertain else
+            "AI analysis complete."
+        )
+    })
     is_uncertain = result["confidence"] < CONFIDENCE_THRESHOLD
 
     new_case = Case(
@@ -149,10 +193,14 @@ def upload():
 @app.route('/uploads/<filename>', methods=['GET'])
 def serve_upload(filename):
     """
-    Serves an uploaded case photo so vets (and the frontend) can view it.
-    'filename' here is the UUID-based filename stored on Case.filename —
-    NOT a user-supplied path, so this is safe from path traversal.
+    Deprecated: photos now stored on Cloudinary.
+    This route kept for backwards compatibility only.
     """
+    # If filename looks like a URL, redirect to it
+    if filename.startswith('http'):
+        return redirect(filename)
+    
+    # Otherwise serve from local disk (for old cases only)
     safe_filename = secure_filename(filename)
     return send_from_directory(UPLOAD_FOLDER, safe_filename)
 
