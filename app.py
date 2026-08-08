@@ -15,7 +15,7 @@ from models import db, Case, User
 import os
 import cloudinary
 import cloudinary.uploader
-
+import requests
 cloudinary.config(
     cloud_name=os.environ.get('CLOUDINARY_CLOUD_NAME'),
     api_key=os.environ.get('CLOUDINARY_API_KEY'),
@@ -98,6 +98,8 @@ def home():
     return "PawCare AI backend is running!"
 
 
+import requests  # Add this import at the top
+
 @app.route('/upload', methods=['POST'])
 def upload():
     if 'image' not in request.files:
@@ -105,7 +107,6 @@ def upload():
 
     file = request.files['image']
     
-    # First check if it's a dog before uploading to Cloudinary
     # Save temporarily to disk for the dog detection check
     original_filename = secure_filename(file.filename)
     extension = os.path.splitext(original_filename)[1]
@@ -114,7 +115,7 @@ def upload():
     file.save(temp_filepath)
     
     if not is_likely_dog(general_model, temp_filepath):
-        os.remove(temp_filepath)  # Clean up temp file
+        os.remove(temp_filepath)
         return jsonify({
             "error": "no_dog_detected",
             "message": "This doesn't appear to be a photo of a dog. Please upload a clear photo of the affected area."
@@ -125,21 +126,24 @@ def upload():
         with open(temp_filepath, 'rb') as f:
             result = cloudinary.uploader.upload(
                 f,
-                folder='pawcare/cases',  # Separate folder for case photos
+                folder='pawcare/cases',
                 resource_type='auto'
             )
         image_url = result['secure_url']
-        os.remove(temp_filepath)  # Clean up temp file
     except Exception as e:
-        os.remove(temp_filepath)  # Clean up temp file
+        os.remove(temp_filepath)
         return jsonify({"error": f"Failed to upload image: {str(e)}"}), 400
 
+    # Run prediction on the local temp file (not the URL)
     location = request.form.get('location')
-    result = predict_image(model, image_url, use_tta=False)  # Pass Cloudinary URL instead of filepath
+    result = predict_image(model, temp_filepath, use_tta=False)
     is_uncertain = result["confidence"] < CONFIDENCE_THRESHOLD
 
+    # Now that prediction is done, clean up the temp file
+    os.remove(temp_filepath)
+
     new_case = Case(
-        filename=image_url,  # Now stores the full Cloudinary URL
+        filename=image_url,  # Store Cloudinary URL in database
         prediction=result["prediction"],
         confidence=result["confidence"],
         is_uncertain=is_uncertain,
@@ -162,33 +166,6 @@ def upload():
             "AI analysis complete."
         )
     })
-    is_uncertain = result["confidence"] < CONFIDENCE_THRESHOLD
-
-    new_case = Case(
-        filename=unique_filename,
-        prediction=result["prediction"],
-        confidence=result["confidence"],
-        is_uncertain=is_uncertain,
-        location=location
-    )
-    db.session.add(new_case)
-    db.session.commit()
-
-    return jsonify({
-        "case_id": new_case.id,
-        "prediction": result["prediction"],
-        "confidence": round(result["confidence"], 3),
-        "is_uncertain": is_uncertain,
-        "is_ambiguous": result["is_ambiguous"],
-        "second_prediction": result["second_prediction"],
-        "second_confidence": round(result["second_confidence"], 3) if result["second_confidence"] else None,
-        "message": (
-            "Low confidence — recommend in-person veterinary examination."
-            if is_uncertain else
-            "AI analysis complete."
-        )
-    })
-
 
 @app.route('/uploads/<filename>', methods=['GET'])
 def serve_upload(filename):
