@@ -408,45 +408,6 @@ def get_pets():
     return jsonify([p.to_dict() for p in pets])
 
 
-@app.route('/pets', methods=['POST'])
-@jwt_required()
-def create_pet():
-    admin = require_admin()
-    if not admin:
-        return jsonify({"error": "Admin access required"}), 403
-
-    # Supports multipart/form-data (with an optional photo) instead of only JSON,
-    # so admins can attach a real photo when adding a pet for adoption.
-    data = request.form if request.form else (request.json or {})
-
-    image_filename = None
-    if 'image' in request.files and request.files['image'].filename:
-        file = request.files['image']
-        original_filename = secure_filename(file.filename)
-        extension = os.path.splitext(original_filename)[1]
-        image_filename = f"{uuid.uuid4().hex}{extension}"
-        filepath = os.path.join(UPLOAD_FOLDER, image_filename)
-        file.save(filepath)
-
-    is_vaccinated_raw = data.get('is_vaccinated', False)
-    # Form data arrives as a string ("true"/"false"), JSON arrives as a real bool — handle both.
-    is_vaccinated = is_vaccinated_raw in (True, 'true', 'True', '1', 1)
-
-    new_pet = Pet(
-    name=data.get('name'),  # Make sure this is sent from frontend
-    breed=data.get('breed'),
-    age=data.get('age'),
-    description=data.get('description'),
-    is_vaccinated=is_vaccinated,
-    image_filename=image_filename,
-    status=data.get('status', 'available'),  # Match the GET filter
-    created_at=datetime.utcnow(),  # Add timestamp
-)
-    db.session.add(new_pet)
-    db.session.commit()
-    return jsonify(new_pet.to_dict()), 201
-
-
 @app.route('/pets/<int:pet_id>/adopt', methods=['POST'])
 @jwt_required()
 def request_adoption(pet_id):
