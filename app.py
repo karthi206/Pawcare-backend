@@ -178,37 +178,6 @@ def get_clusters():
     clusters = detect_clusters(cases_as_dicts)
     return jsonify(clusters)
 
-
-@app.route('/setup/make-admin', methods=['POST'])
-def make_admin():
-    """
-    One-time setup route to promote an existing user to admin.
-    Protected by a secret key (set as ADMIN_SETUP_KEY in Render's
-    environment variables) so random people can't call this.
-
-    Usage: POST with JSON body { "username": "...", "setup_key": "..." }
-    Recommended: delete this route (or unset ADMIN_SETUP_KEY) once
-    you've created your admin account.
-    """
-    setup_key = os.environ.get('ADMIN_SETUP_KEY')
-    if not setup_key:
-        return jsonify({"error": "Admin setup is disabled (ADMIN_SETUP_KEY not configured)"}), 403
-
-    data = request.json or {}
-    if data.get('setup_key') != setup_key:
-        return jsonify({"error": "Invalid setup key"}), 403
-
-    username = data.get('username')
-    user = User.query.filter_by(username=username).first()
-    if not user:
-        return jsonify({"error": "User not found — register a normal account first, then promote it"}), 404
-
-    user.role = 'admin'
-    user.is_verified = True
-    db.session.commit()
-    return jsonify({"message": f"{user.username} is now an admin", "user": user.to_dict()})
-
-
 @app.route('/auth/register', methods=['POST'])
 def register():
     data = request.json
