@@ -136,7 +136,7 @@ def upload():
 
     # Run prediction on the local temp file (not the URL)
     location = request.form.get('location')
-    result = predict_image(model, temp_filepath, use_tta=False)
+    result = predict_image(model, temp_filepath, use_tta=False)  # Pass local temp file, not URL
     is_uncertain = result["confidence"] < CONFIDENCE_THRESHOLD
 
     # Now that prediction is done, clean up the temp file
