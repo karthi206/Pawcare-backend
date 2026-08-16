@@ -13,9 +13,12 @@ class Case(db.Model):
     status = db.Column(db.String(50), default="pending")
     location = db.Column(db.String(255), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    vet_confirmed_label = db.Column(db.String(100), nullable=True)  # new
-    # In models.py, add to Case:
+    vet_confirmed_label = db.Column(db.String(100), nullable=True)
     reviewed_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    # NEW: which user reported this case. Nullable so existing rows created
+    # before this column existed (from the old public /upload) don't break —
+    # they'll just show up as "unowned" and only visible to vets/admins.
+    reported_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
 
     def to_dict(self):
         return {
@@ -27,7 +30,8 @@ class Case(db.Model):
             "status": self.status,
             "location": self.location,
             "created_at": self.created_at.isoformat(),
-            "vet_confirmed_label": self.vet_confirmed_label  # new
+            "vet_confirmed_label": self.vet_confirmed_label,
+            "reported_by_id": self.reported_by_id,
         }
 
 class User(db.Model):
@@ -62,6 +66,8 @@ class User(db.Model):
             "clinic_address": self.clinic_address,
             "is_verified": self.is_verified,
         }
+
+
 class NGO(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(200), nullable=False)
@@ -94,7 +100,7 @@ class NGONotification(db.Model):
 
 class Pet(db.Model):
     __tablename__ = 'pet'
-    
+
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
     breed = db.Column(db.String(100))
@@ -104,12 +110,11 @@ class Pet(db.Model):
     is_vaccinated = db.Column(db.Boolean)
     status = db.Column(db.String(20), default='available')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    created_at = db.Column(db.DateTime)  # <-- PROBABLY MISSING DEFAULT
 
     def to_dict(self):
         return {
             "id": self.id, "name": self.name, "breed": self.breed, "age": self.age,
-            "description": self.description, "image_filename": self.image_filename,"image_filename": self.image_filename,
+            "description": self.description, "image_filename": self.image_filename,
             "is_vaccinated": self.is_vaccinated, "status": self.status
         }
 

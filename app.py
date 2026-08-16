@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, redirect
 import os
 import sys
 from flask_cors import CORS
@@ -7,15 +7,14 @@ import uuid
 from werkzeug.utils import secure_filename
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from models import db, Case, User, NGO, NGONotification, Pet, AdoptionRequest
-from datetime import datetime
+from datetime import datetime, timedelta
+from PIL import Image
 # Let Flask find files inside model/ - must come BEFORE importing from it
 sys.path.append(os.path.join(os.path.dirname(__file__), 'model'))
 from cnn_model import load_model, predict_image, load_general_model, is_likely_dog
-from models import db, Case, User
-import os
 import cloudinary
 import cloudinary.uploader
-import requests
+
 cloudinary.config(
     cloud_name=os.environ.get('CLOUDINARY_CLOUD_NAME'),
     api_key=os.environ.get('CLOUDINARY_API_KEY'),
@@ -29,13 +28,7 @@ CORS(app, origins=[
     "https://pawcare-frontend-azure.vercel.app"
 ])
 # Database configuration
-# Uses a real, persistent Postgres database (e.g. Neon) when DATABASE_URL is set in
-# Render's environment variables — falls back to the old local SQLite file only if it
-# isn't set, so nothing breaks for local development.
 database_url = os.environ.get('DATABASE_URL', 'sqlite:///cases.db')
-# Some providers (Neon, Heroku-style) give a URL starting with "postgres://", but
-# SQLAlchemy 1.4+ requires "postgresql://" — this translates it automatically so you
-# don't have to remember to edit the URL by hand.
 if database_url.startswith('postgres://'):
     database_url = database_url.replace('postgres://', 'postgresql://', 1)
 app.config['SQLALCHEMY_DATABASE_URI'] = database_url
@@ -48,6 +41,70 @@ jwt = JWTManager(app)
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# ── UPLOAD SAFETY LIMITS ────────────────────────────────────────────────
+# Reject anything over 10MB at the Flask level before it's even fully
+# read into memory (Flask returns 413 automatically once this is set).
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10 MB
+
+ALLOWED_IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'webp'}
+ALLOWED_IMAGE_MIME_TYPES = {'image/png', 'image/jpeg', 'image/webp'}
+MIN_IMAGE_DIMENSION = 64      # px, reject tiny/garbage images
+MAX_IMAGE_DIMENSION = 6000    # px, reject decompression-bomb-style images
+
+
+def allowed_extension(filename):
+    return '.' in filename and \
+        filename.rsplit('.', 1)[1].lower() in ALLOWED_IMAGE_EXTENSIONS
+
+
+def validate_image_file(file_storage):
+    """
+    Validates an uploaded file is actually a real, reasonably-sized image
+    before we do anything else with it (save to disk, run inference,
+    upload to Cloudinary). Returns (is_valid, error_message).
+
+    Checks, in order:
+      1. A filename was actually provided
+      2. Extension is on the allowlist
+      3. Declared MIME type is on the allowlist (defense in depth — this
+         can be spoofed by the client, so it's not relied on alone)
+      4. Pillow can actually decode it as an image (catches renamed
+         non-image files, corrupted files, zip bombs disguised as images)
+      5. Image dimensions are within sane bounds
+    """
+    if not file_storage or not file_storage.filename:
+        return False, "No file provided"
+
+    if not allowed_extension(file_storage.filename):
+        return False, "Unsupported file type. Allowed: PNG, JPG, JPEG, WEBP"
+
+    if file_storage.mimetype not in ALLOWED_IMAGE_MIME_TYPES:
+        return False, "Unsupported file type"
+
+    try:
+        # verify() reads the file to check it's a valid, non-corrupt image
+        # without decoding full pixel data — but it consumes the stream,
+        # so we need to seek back to 0 afterwards to actually use the file.
+        file_storage.stream.seek(0)
+        img = Image.open(file_storage.stream)
+        img.verify()
+
+        # verify() invalidates the Image object, so re-open to check dimensions
+        file_storage.stream.seek(0)
+        img = Image.open(file_storage.stream)
+        width, height = img.size
+        if width < MIN_IMAGE_DIMENSION or height < MIN_IMAGE_DIMENSION:
+            return False, f"Image too small (minimum {MIN_IMAGE_DIMENSION}x{MIN_IMAGE_DIMENSION}px)"
+        if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
+            return False, f"Image too large (maximum {MAX_IMAGE_DIMENSION}x{MAX_IMAGE_DIMENSION}px)"
+
+        file_storage.stream.seek(0)
+    except Exception:
+        return False, "File is not a valid image"
+
+    return True, None
+
+
 # Load the trained CNN model ONCE when the server starts
 model = load_model('model/pawcare_model.onnx')
 general_model = load_general_model('model/general_imagenet_model.onnx')  # Re-enabled: ONNX version is lightweight
@@ -58,10 +115,6 @@ with app.app_context():
     db.create_all()
 
     # ── PERMANENT ADMIN AUTO-SEED ──────────────────────────────────────
-    # Render's free tier wipes the database on every redeploy. Instead of
-    # manually re-promoting yourself to admin every time, this block runs
-    # on EVERY startup and guarantees your admin account exists — using
-    # the username/password/PIN you set once in Render's Environment tab.
     FIXED_ADMIN_USERNAME = os.environ.get('FIXED_ADMIN_USERNAME')
     FIXED_ADMIN_PASSWORD = os.environ.get('FIXED_ADMIN_PASSWORD')
     FIXED_ADMIN_EMAIL = os.environ.get('FIXED_ADMIN_EMAIL', 'admin@pawcare.local')
@@ -80,8 +133,6 @@ with app.app_context():
             db.session.commit()
             print(f"[startup] Created permanent admin account: {FIXED_ADMIN_USERNAME}")
         elif existing_admin.role != 'admin':
-            # Covers the case where the database survived but this account
-            # somehow isn't admin — self-heals instead of silently staying broken.
             existing_admin.role = 'admin'
             existing_admin.is_verified = True
             db.session.commit()
@@ -93,27 +144,60 @@ with app.app_context():
     # ─────────────────────────────────────────────────────────────────────
 
 
+def get_current_user_obj():
+    """Helper: load the User row for the current JWT identity, or None."""
+    user_id = get_jwt_identity()
+    if not user_id:
+        return None
+    return User.query.get(int(user_id))
+
+
+def require_admin():
+    """Helper: returns the current user if they're an admin, otherwise None."""
+    user = get_current_user_obj()
+    if not user or user.role != 'admin':
+        return None
+    return user
+
+
+def require_verified_vet_or_admin():
+    """Helper: returns the current user if they're an admin or a verified vet."""
+    user = get_current_user_obj()
+    if not user:
+        return None
+    if user.role == 'admin':
+        return user
+    if user.role == 'vet' and user.is_verified:
+        return user
+    return None
+
+
 @app.route('/')
 def home():
     return "PawCare AI backend is running!"
 
 
-import requests  # Add this import at the top
-
 @app.route('/upload', methods=['POST'])
+@jwt_required()
 def upload():
+    user_id = get_jwt_identity()
+
     if 'image' not in request.files:
         return jsonify({"error": "No image uploaded"}), 400
 
     file = request.files['image']
-    
+
+    is_valid, error_message = validate_image_file(file)
+    if not is_valid:
+        return jsonify({"error": "invalid_image", "message": error_message}), 400
+
     # Save temporarily to disk for the dog detection check
     original_filename = secure_filename(file.filename)
     extension = os.path.splitext(original_filename)[1]
     temp_filename = f"{uuid.uuid4().hex}{extension}"
     temp_filepath = os.path.join(UPLOAD_FOLDER, temp_filename)
     file.save(temp_filepath)
-    
+
     if not is_likely_dog(general_model, temp_filepath):
         os.remove(temp_filepath)
         return jsonify({
@@ -147,7 +231,8 @@ def upload():
         prediction=result["prediction"],
         confidence=result["confidence"],
         is_uncertain=is_uncertain,
-        location=location
+        location=location,
+        reported_by_id=int(user_id),
     )
     db.session.add(new_case)
     db.session.commit()
@@ -167,41 +252,66 @@ def upload():
         )
     })
 
+
 @app.route('/uploads/<filename>', methods=['GET'])
 def serve_upload(filename):
     """
     Deprecated: photos now stored on Cloudinary.
     This route kept for backwards compatibility only.
     """
-    # If filename looks like a URL, redirect to it
     if filename.startswith('http'):
         return redirect(filename)
-    
-    # Otherwise serve from local disk (for old cases only)
+
     safe_filename = secure_filename(filename)
     return send_from_directory(UPLOAD_FOLDER, safe_filename)
 
 
 @app.route('/cases', methods=['GET'])
+@jwt_required()
 def get_cases():
-    cases = Case.query.order_by(Case.created_at.desc()).all()
+    user = get_current_user_obj()
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    # Vets and admins need to see every case to do their jobs (review /
+    # verify diagnoses, manage outbreaks). Regular users only ever see
+    # the cases they personally reported.
+    if user.role in ('vet', 'admin'):
+        cases = Case.query.order_by(Case.created_at.desc()).all()
+    else:
+        cases = Case.query.filter_by(reported_by_id=user.id).order_by(Case.created_at.desc()).all()
+
     return jsonify([case.to_dict() for case in cases])
 
 
 @app.route('/cases/<int:case_id>', methods=['GET'])
+@jwt_required()
 def get_case(case_id):
+    user = get_current_user_obj()
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
     case = Case.query.get(case_id)
     if not case:
         return jsonify({"error": "Case not found"}), 404
+
+    if user.role not in ('vet', 'admin') and case.reported_by_id != user.id:
+        return jsonify({"error": "You don't have access to this case"}), 403
+
     return jsonify(case.to_dict())
 
 
 @app.route('/clusters', methods=['GET'])
+@jwt_required()
 def get_clusters():
+    # Cluster data aggregates locations/diseases across ALL users' cases,
+    # so this stays behind login (any logged-in role) rather than fully
+    # public, but isn't restricted to vet/admin like /cases is.
     all_cases = Case.query.all()
     cases_as_dicts = [c.to_dict() for c in all_cases]
     clusters = detect_clusters(cases_as_dicts)
     return jsonify(clusters)
+
 
 @app.route('/auth/register', methods=['POST'])
 def register():
@@ -266,20 +376,22 @@ def get_current_user():
 @app.route('/cases/<int:case_id>/status', methods=['PATCH'])
 @jwt_required()
 def update_case_status(case_id):
-    user_id = get_jwt_identity()
-    user = User.query.get(int(user_id))
+    # Only verified vets or admins may change a case's status or diagnosis
+    # at all — this used to only gate the vet_confirmed_label field, which
+    # meant any logged-in regular user could still change `status` freely
+    # (e.g. flip a case straight to "resolved") as long as they didn't
+    # also send a vet_confirmed_label.
+    user = require_verified_vet_or_admin()
+    if not user:
+        return jsonify({"error": "Only verified veterinarians or admins can update case status"}), 403
 
     case = Case.query.get(case_id)
     if not case:
         return jsonify({"error": "Case not found"}), 404
 
-    data = request.json
+    data = request.json or {}
     new_status = data.get('status')
     vet_label = data.get('vet_confirmed_label')
-
-    # Only verified vets can confirm/correct a diagnosis
-    if vet_label and (user.role != 'vet' or not user.is_verified):
-        return jsonify({"error": "Only verified veterinarians can confirm diagnoses"}), 403
 
     if new_status not in ['pending', 'vet_confirmed', 'resolved']:
         return jsonify({"error": "Invalid status"}), 400
@@ -295,13 +407,6 @@ def update_case_status(case_id):
 
     db.session.commit()
     return jsonify(case.to_dict())
-def require_admin():
-    """Helper: returns the current user if they're an admin, otherwise None."""
-    user_id = get_jwt_identity()
-    user = User.query.get(int(user_id))
-    if not user or user.role != 'admin':
-        return None
-    return user
 
 
 @app.route('/admin/pending-vets', methods=['GET'])
@@ -342,25 +447,15 @@ def reject_vet(vet_id):
     if not vet or vet.role != 'vet':
         return jsonify({"error": "Vet not found"}), 404
 
-    # CHANGED: previously this used db.session.delete(vet), which permanently erased the
-    # account (username, email, password) entirely. Now the account is preserved — it's
-    # downgraded to a regular 'user' instead, so the person can still log in and use the
-    # app normally, they just lose vet privileges. Nothing about their login is destroyed.
     vet.role = 'user'
     vet.is_verified = False
     db.session.commit()
     return jsonify({"message": f"{vet.username}'s vet application was rejected. Their account remains active as a regular user."})
-from models import db, Case, User, NGO, NGONotification, Pet, AdoptionRequest
+
 
 @app.route('/admin/export-corrections', methods=['GET'])
 @jwt_required()
 def export_corrections():
-    """
-    Human-in-the-loop export: returns every case where a vet has
-    confirmed/corrected the AI's prediction. Use this list to pull
-    the actual image files (via /uploads/<filename>) and retrain
-    the model in Colab with the vet-confirmed labels.
-    """
     admin = require_admin()
     if not admin:
         return jsonify({"error": "Admin access required"}), 403
@@ -412,16 +507,40 @@ def create_ngo():
     return jsonify(new_ngo.to_dict()), 201
 
 
+NGO_NOTIFY_COOLDOWN = timedelta(minutes=5)
+MAX_NOTIFY_MESSAGE_LENGTH = 500
+
+
 @app.route('/ngos/<int:ngo_id>/notify', methods=['POST'])
 @jwt_required()
 def notify_ngo(ngo_id):
+    # Still intentionally open to any authenticated user (any user should
+    # be able to flag a nearby outbreak to an NGO) but now with basic
+    # input validation and an anti-spam cooldown, since previously there
+    # was no limit on how often or with what content someone could hit
+    # this endpoint.
     user_id = get_jwt_identity()
     ngo = NGO.query.get(ngo_id)
     if not ngo:
         return jsonify({"error": "NGO not found"}), 404
 
     data = request.json or {}
-    notification = NGONotification(ngo_id=ngo_id, user_id=int(user_id), message=data.get('message'))
+    message = (data.get('message') or '').strip()
+    if not message:
+        return jsonify({"error": "message is required"}), 400
+    if len(message) > MAX_NOTIFY_MESSAGE_LENGTH:
+        return jsonify({"error": f"message must be {MAX_NOTIFY_MESSAGE_LENGTH} characters or fewer"}), 400
+
+    recent_cutoff = datetime.utcnow() - NGO_NOTIFY_COOLDOWN
+    recent_notification = NGONotification.query.filter(
+        NGONotification.ngo_id == ngo_id,
+        NGONotification.user_id == int(user_id),
+        NGONotification.created_at >= recent_cutoff,
+    ).first()
+    if recent_notification:
+        return jsonify({"error": "You've already notified this NGO recently. Please wait a few minutes before trying again."}), 429
+
+    notification = NGONotification(ngo_id=ngo_id, user_id=int(user_id), message=message)
     db.session.add(notification)
     db.session.commit()
     return jsonify({"message": f"{ngo.name} has been notified"}), 201
@@ -449,6 +568,8 @@ def request_adoption(pet_id):
     db.session.add(new_request)
     db.session.commit()
     return jsonify({"message": f"Adoption request for {pet.name} submitted"}), 201
+
+
 @app.route('/pets', methods=['POST'])
 @jwt_required()
 def create_pet():
@@ -461,11 +582,15 @@ def create_pet():
     image_url = None
     if 'image' in request.files and request.files['image'].filename:
         file = request.files['image']
+
+        is_valid, error_message = validate_image_file(file)
+        if not is_valid:
+            return jsonify({"error": "invalid_image", "message": error_message}), 400
+
         try:
-            # Upload to Cloudinary
             result = cloudinary.uploader.upload(
                 file,
-                folder='pawcare/pets',  # Organizes uploads into a folder
+                folder='pawcare/pets',
                 resource_type='auto'
             )
             image_url = result['secure_url']
@@ -481,7 +606,7 @@ def create_pet():
         age=data.get('age'),
         description=data.get('description'),
         is_vaccinated=is_vaccinated,
-        image_filename=image_url,  # Now stores the full Cloudinary URL
+        image_filename=image_url,
         status=data.get('status', 'available'),
         created_at=datetime.utcnow(),
     )
