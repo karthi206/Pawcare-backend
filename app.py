@@ -43,8 +43,6 @@ db.init_app(app)
 
 app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'dev-only-fallback-key')
 
-app.config['JWT_COOKIE_SECURE'] = os.getenv('JWT_COOKIE_SECURE', 'True').lower() == 'true'
-
 # ── JWT delivered via httpOnly cookie instead of the response body ─────────
 # Previously the token was returned as JSON and the frontend stored it in
 # localStorage, which any injected/XSS script on the page could read
