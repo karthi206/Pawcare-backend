@@ -5,7 +5,10 @@ from flask_cors import CORS
 from clustering import detect_clusters
 import uuid
 from werkzeug.utils import secure_filename
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask_jwt_extended import (
+    JWTManager, create_access_token, jwt_required, get_jwt_identity,
+    set_access_cookies, unset_jwt_cookies,
+)
 from models import db, Case, User, NGO, NGONotification, Pet, AdoptionRequest
 from datetime import datetime, timedelta
 from PIL import Image
@@ -22,11 +25,14 @@ cloudinary.config(
 )
 
 app = Flask(__name__)
+# supports_credentials=True is required for cookie-based JWTs — without it
+# the browser will not send/accept the auth cookie on cross-origin requests
+# (frontend on vercel.app, backend on onrender.com are different origins).
 CORS(app, origins=[
     "http://127.0.0.1:5173",
     "http://localhost:5173",
     "https://pawcare-frontend-azure.vercel.app"
-])
+], supports_credentials=True)
 # Database configuration
 database_url = os.environ.get('DATABASE_URL', 'sqlite:///cases.db')
 if database_url.startswith('postgres://'):
@@ -36,6 +42,27 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(app)
 
 app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'dev-only-fallback-key')
+
+app.config['JWT_COOKIE_SECURE'] = os.getenv('JWT_COOKIE_SECURE', 'True').lower() == 'true'
+
+# ── JWT delivered via httpOnly cookie instead of the response body ─────────
+# Previously the token was returned as JSON and the frontend stored it in
+# localStorage, which any injected/XSS script on the page could read
+# directly. It's now set as an httpOnly cookie — JavaScript can't read it at
+# all — with a separate, non-httpOnly CSRF cookie the frontend must echo
+# back as a header on state-changing requests (the standard "double submit"
+# pattern flask-jwt-extended implements for you).
+app.config['JWT_TOKEN_LOCATION'] = ['cookies']
+app.config['JWT_ACCESS_COOKIE_PATH'] = '/'
+app.config['JWT_COOKIE_CSRF_PROTECT'] = True
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
+# Frontend and backend are on different domains in production, so the
+# cookie must be SameSite=None + Secure to be sent cross-site at all — that
+# combination only works over HTTPS. Set JWT_COOKIE_SECURE=false in your
+# LOCAL dev .env only if you're testing over plain http://localhost.
+app.config['JWT_COOKIE_SECURE'] = os.environ.get('JWT_COOKIE_SECURE', 'true').lower() != 'false'
+app.config['JWT_COOKIE_SAMESITE'] = 'None' if app.config['JWT_COOKIE_SECURE'] else 'Lax'
+
 jwt = JWTManager(app)
 
 UPLOAD_FOLDER = 'uploads'
@@ -360,7 +387,20 @@ def login():
         return jsonify({"error": "Invalid username or password"}), 401
 
     access_token = create_access_token(identity=str(user.id))
-    return jsonify({"access_token": access_token, "user": user.to_dict()})
+    resp = jsonify({"user": user.to_dict()})
+    # Sets both the httpOnly JWT cookie and the readable CSRF cookie.
+    # No token in the JSON body anymore — nothing for client-side JS to
+    # read or accidentally leak.
+    set_access_cookies(resp, access_token)
+    return resp
+
+
+@app.route('/auth/logout', methods=['POST'])
+@jwt_required()
+def logout():
+    resp = jsonify({"message": "Logged out"})
+    unset_jwt_cookies(resp)
+    return resp
 
 
 @app.route('/auth/me', methods=['GET'])
@@ -466,7 +506,13 @@ def export_corrections():
     for case in corrected_cases:
         export_data.append({
             "case_id": case.id,
-            "image_url": f"/uploads/{case.filename}",
+            # case.filename is already a full Cloudinary URL (post-migration) —
+            # previously this prepended "/uploads/" to it, producing a broken
+            # path like "/uploads/https://res.cloudinary.com/...". Old rows
+            # created before the Cloudinary migration may still hold a bare
+            # local filename, so we only add the legacy prefix in that case.
+            "image_url": case.filename if case.filename.startswith('http')
+                         else f"/uploads/{case.filename}",
             "ai_prediction": case.prediction,
             "ai_confidence": case.confidence,
             "vet_confirmed_label": case.vet_confirmed_label,

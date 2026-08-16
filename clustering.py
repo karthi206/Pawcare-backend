@@ -1,81 +1,178 @@
-from math import radians, sin, cos, sqrt, atan2
+"""
+Outbreak cluster detection.
 
-CLUSTER_RADIUS_KM = 1.0   # cases within 1km of each other count as "nearby"
-MIN_CLUSTER_SIZE = 2      # need at least this many nearby same-disease cases to call it a cluster
+CHANGES vs. the original version:
+  1. Time windows — previously every case ever reported was clustered
+     together with no regard for when it happened, so a handful of old
+     resolved cases from months ago could still show as an "active"
+     outbreak today. Clusters are now built only from cases inside a
+     rolling time window (default 14 days).
+  2. Vet-confirmation weighting — previously a raw AI label counted
+     exactly the same as a vet-confirmed diagnosis. A cluster of five
+     low-confidence AI guesses is much weaker evidence than two
+     vet-confirmed cases. Each case now contributes a weight based on
+     how trustworthy its label is, and a cluster only fires once the
+     total weight crosses a threshold — not just a raw case count.
+
+Weighting scheme (tunable via WEIGHT_* constants below):
+  - vet_confirmed case                     -> 1.0
+  - AI prediction, NOT flagged uncertain   -> 0.6
+  - AI prediction, flagged uncertain       -> 0.25
+
+"Healthy" is never counted toward an outbreak, whether it's the AI
+prediction or the vet-confirmed label.
+"""
+
+import math
+from datetime import datetime, timedelta
+
+RADIUS_KM = 1.0
+TIME_WINDOW_DAYS = 14
+MIN_WEIGHT = 2.0          # weighted score required to call it a cluster
+MIN_CASE_COUNT = 2        # still require at least 2 distinct cases
+
+WEIGHT_VET_CONFIRMED = 1.0
+WEIGHT_AI_CONFIDENT = 0.6
+WEIGHT_AI_UNCERTAIN = 0.25
+
+EXCLUDED_LABELS = {'Healthy'}
 
 
-def haversine_distance(lat1, lon1, lat2, lon2):
-    """Returns distance in kilometers between two lat/lon points."""
-    R = 6371
-    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
-    c = 2 * atan2(sqrt(a), sqrt(1 - a))
-    return R * c
+def _haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
 
 
-def parse_location(location_str):
-    """Converts '12.9716, 77.5946' into (12.9716, 77.5946). Returns None if invalid."""
+def _parse_location(location_str):
+    """Location is stored as 'lat,lon'. Returns (lat, lon) or None if
+    missing/unparseable (e.g. a free-text address instead of coordinates)."""
     if not location_str:
         return None
     try:
-        lat, lon = map(float, location_str.split(","))
-        return (lat, lon)
+        lat_str, lon_str = location_str.split(',', 1)
+        return float(lat_str.strip()), float(lon_str.strip())
     except (ValueError, AttributeError):
         return None
 
 
-def detect_clusters(cases):
+def _parse_created_at(created_at_str):
+    try:
+        return datetime.fromisoformat(created_at_str)
+    except (ValueError, TypeError):
+        return None
+
+
+def _effective_label_and_weight(case):
+    """Decide what disease label this case counts as, and how much it
+    should weigh. Vet-confirmed labels always win over the AI prediction —
+    they're a stronger signal and may correct the AI entirely."""
+    vet_label = case.get('vet_confirmed_label')
+    if vet_label:
+        return vet_label, WEIGHT_VET_CONFIRMED
+
+    prediction = case.get('prediction')
+    if case.get('is_uncertain'):
+        return prediction, WEIGHT_AI_UNCERTAIN
+    return prediction, WEIGHT_AI_CONFIDENT
+
+
+def detect_clusters(cases, radius_km=RADIUS_KM, time_window_days=TIME_WINDOW_DAYS,
+                     min_weight=MIN_WEIGHT, now=None):
     """
-    Groups cases by disease, then finds tight geographic clusters within each disease group.
-    `cases` should be a list of dicts with at least: id, prediction, location.
-    Returns a list of cluster summaries.
+    cases: list of dicts, as produced by Case.to_dict()
+    Returns a list of cluster dicts:
+      {
+        "disease": str,
+        "case_count": int,
+        "case_ids": [int, ...],
+        "center_lat": float,
+        "center_lon": float,
+        "weighted_score": float,
+        "vet_confirmed_count": int,
+      }
     """
-    # Step 1: parse and filter to only cases with valid locations
-    located_cases = []
+    now = now or datetime.utcnow()
+    cutoff = now - timedelta(days=time_window_days)
+
+    # Build enriched, filtered records: valid location, recent, real disease label
+    points = []
     for case in cases:
-        coords = parse_location(case.get("location"))
-        if coords:
-            located_cases.append({**case, "lat": coords[0], "lon": coords[1]})
+        coords = _parse_location(case.get('location'))
+        if coords is None:
+            continue
 
-    # Step 2: group by disease type
-    by_disease = {}
-    for case in located_cases:
-        disease = case["prediction"]
-        by_disease.setdefault(disease, []).append(case)
+        created_at = _parse_created_at(case.get('created_at'))
+        if created_at is None or created_at < cutoff:
+            continue
 
-    # Step 3: within each disease group, find clusters
+        label, weight = _effective_label_and_weight(case)
+        if not label or label in EXCLUDED_LABELS:
+            continue
+
+        points.append({
+            'id': case.get('id'),
+            'lat': coords[0],
+            'lon': coords[1],
+            'label': label,
+            'weight': weight,
+            'is_vet_confirmed': bool(case.get('vet_confirmed_label')),
+        })
+
     clusters = []
-    for disease, disease_cases in by_disease.items():
-        visited = set()
+    # Group by disease label first — an outbreak cluster is always single-disease
+    labels = {p['label'] for p in points}
+    for label in labels:
+        label_points = [p for p in points if p['label'] == label]
 
-        for i, case in enumerate(disease_cases):
-            if case["id"] in visited:
+        # Simple single-linkage grouping: start every point in its own group,
+        # then merge any two groups that have at least one point pair within
+        # radius_km of each other. Small case counts (dozens, not millions)
+        # so an O(n^2) pass per merge round is plenty fast here.
+        groups = [[p] for p in label_points]
+        merged = True
+        while merged:
+            merged = False
+            for i in range(len(groups)):
+                for j in range(i + 1, len(groups)):
+                    if _groups_within_radius(groups[i], groups[j], radius_km):
+                        groups[i].extend(groups[j])
+                        del groups[j]
+                        merged = True
+                        break
+                if merged:
+                    break
+
+        for group in groups:
+            if len(group) < MIN_CASE_COUNT:
+                continue
+            weighted_score = sum(p['weight'] for p in group)
+            if weighted_score < min_weight:
                 continue
 
-            # Find all other cases of this disease within CLUSTER_RADIUS_KM
-            nearby = [case]
-            for other in disease_cases:
-                if other["id"] == case["id"] or other["id"] in visited:
-                    continue
-                dist = haversine_distance(case["lat"], case["lon"], other["lat"], other["lon"])
-                if dist <= CLUSTER_RADIUS_KM:
-                    nearby.append(other)
+            center_lat = sum(p['lat'] for p in group) / len(group)
+            center_lon = sum(p['lon'] for p in group) / len(group)
+            clusters.append({
+                "disease": label,
+                "case_count": len(group),
+                "case_ids": [p['id'] for p in group],
+                "center_lat": center_lat,
+                "center_lon": center_lon,
+                "weighted_score": round(weighted_score, 2),
+                "vet_confirmed_count": sum(1 for p in group if p['is_vet_confirmed']),
+            })
 
-            if len(nearby) >= MIN_CLUSTER_SIZE:
-                for c in nearby:
-                    visited.add(c["id"])
-
-                avg_lat = sum(c["lat"] for c in nearby) / len(nearby)
-                avg_lon = sum(c["lon"] for c in nearby) / len(nearby)
-
-                clusters.append({
-                    "disease": disease,
-                    "case_count": len(nearby),
-                    "case_ids": [c["id"] for c in nearby],
-                    "center_lat": round(avg_lat, 4),
-                    "center_lon": round(avg_lon, 4),
-                })
-
+    # Strongest evidence first
+    clusters.sort(key=lambda c: c['weighted_score'], reverse=True)
     return clusters
+
+
+def _groups_within_radius(group_a, group_b, radius_km):
+    for a in group_a:
+        for b in group_b:
+            if _haversine_km(a['lat'], a['lon'], b['lat'], b['lon']) <= radius_km:
+                return True
+    return False
