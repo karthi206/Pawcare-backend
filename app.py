@@ -41,7 +41,13 @@ app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(app)
 
-app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'dev-only-fallback-key')
+JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY')
+if not JWT_SECRET_KEY:
+    if os.environ.get('FLASK_ENV') == 'development' or app.debug:
+        JWT_SECRET_KEY = 'dev-only-fallback-key'
+    else:
+        raise RuntimeError("JWT_SECRET_KEY environment variable is required in production")
+app.config['JWT_SECRET_KEY'] = JWT_SECRET_KEY
 
 # ── JWT delivered via httpOnly cookie instead of the response body ─────────
 # Previously the token was returned as JSON and the frontend stored it in
