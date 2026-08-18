@@ -7,7 +7,7 @@ import uuid
 from werkzeug.utils import secure_filename
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity,
-    set_access_cookies, unset_jwt_cookies,
+    set_access_cookies, unset_jwt_cookies, get_csrf_token, get_jwt,
 )
 from models import db, Case, User, NGO, NGONotification, Pet, AdoptionRequest
 from datetime import datetime, timedelta
@@ -391,7 +391,8 @@ def login():
         return jsonify({"error": "Invalid username or password"}), 401
 
     access_token = create_access_token(identity=str(user.id))
-    resp = jsonify({"user": user.to_dict()})
+    csrf_token = get_csrf_token(access_token)
+    resp = jsonify({"user": user.to_dict(), "csrf_token": csrf_token})
     # Sets both the httpOnly JWT cookie and the readable CSRF cookie.
     # No token in the JSON body anymore — nothing for client-side JS to
     # read or accidentally leak.
@@ -414,7 +415,9 @@ def get_current_user():
     user = User.query.get(int(user_id))
     if not user:
         return jsonify({"error": "User not found"}), 404
-    return jsonify(user.to_dict())
+    raw_jwt = get_jwt()
+    csrf_token = raw_jwt.get("csrf")
+    return jsonify({**user.to_dict(), "csrf_token": csrf_token})
 
 
 @app.route('/cases/<int:case_id>/status', methods=['PATCH'])
