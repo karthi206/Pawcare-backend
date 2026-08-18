@@ -229,59 +229,61 @@ def upload():
     temp_filepath = os.path.join(UPLOAD_FOLDER, temp_filename)
     file.save(temp_filepath)
 
-    if not is_likely_dog(general_model, temp_filepath):
-        os.remove(temp_filepath)
-        return jsonify({
-            "error": "no_dog_detected",
-            "message": "This doesn't appear to be a photo of a dog. Please upload a clear photo of the affected area."
-        }), 422
-
-    # Dog check passed, now upload to Cloudinary
     try:
-        with open(temp_filepath, 'rb') as f:
-            result = cloudinary.uploader.upload(
-                f,
-                folder='pawcare/cases',
-                resource_type='auto'
+        if not is_likely_dog(general_model, temp_filepath):
+            return jsonify({
+                "error": "no_dog_detected",
+                "message": "This doesn't appear to be a photo of a dog. Please upload a clear photo of the affected area."
+            }), 422
+
+        # Run prediction on the local temp file
+        location = request.form.get('location')
+        result = predict_image(model, temp_filepath, use_tta=False)
+        is_uncertain = result["confidence"] < CONFIDENCE_THRESHOLD
+
+        case_id = None
+        # Only save case and upload to Cloudinary if user is authenticated
+        if user_id:
+            try:
+                with open(temp_filepath, 'rb') as f:
+                    upload_result = cloudinary.uploader.upload(
+                        f,
+                        folder='pawcare/cases',
+                        resource_type='auto'
+                    )
+                image_url = upload_result['secure_url']
+            except Exception as e:
+                return jsonify({"error": f"Failed to upload image: {str(e)}"}), 400
+
+            new_case = Case(
+                filename=image_url,
+                prediction=result["prediction"],
+                confidence=result["confidence"],
+                is_uncertain=is_uncertain,
+                location=location,
+                reported_by_id=int(user_id),
             )
-        image_url = result['secure_url']
-    except Exception as e:
-        os.remove(temp_filepath)
-        return jsonify({"error": f"Failed to upload image: {str(e)}"}), 400
+            db.session.add(new_case)
+            db.session.commit()
+            case_id = new_case.id
 
-    # Run prediction on the local temp file (not the URL)
-    location = request.form.get('location')
-    result = predict_image(model, temp_filepath, use_tta=False)  # Pass local temp file, not URL
-    is_uncertain = result["confidence"] < CONFIDENCE_THRESHOLD
-
-    # Now that prediction is done, clean up the temp file
-    os.remove(temp_filepath)
-
-    new_case = Case(
-        filename=image_url,  # Store Cloudinary URL in database
-        prediction=result["prediction"],
-        confidence=result["confidence"],
-        is_uncertain=is_uncertain,
-        location=location,
-        reported_by_id=int(user_id) if user_id else None,
-    )
-    db.session.add(new_case)
-    db.session.commit()
-
-    return jsonify({
-        "case_id": new_case.id,
-        "prediction": result["prediction"],
-        "confidence": round(result["confidence"], 3),
-        "is_uncertain": is_uncertain,
-        "is_ambiguous": result["is_ambiguous"],
-        "second_prediction": result["second_prediction"],
-        "second_confidence": round(result["second_confidence"], 3) if result["second_confidence"] else None,
-        "message": (
-            "Low confidence — recommend in-person veterinary examination."
-            if is_uncertain else
-            "AI analysis complete."
-        )
-    })
+        return jsonify({
+            "case_id": case_id,
+            "prediction": result["prediction"],
+            "confidence": round(result["confidence"], 3),
+            "is_uncertain": is_uncertain,
+            "is_ambiguous": result["is_ambiguous"],
+            "second_prediction": result["second_prediction"],
+            "second_confidence": round(result["second_confidence"], 3) if result["second_confidence"] else None,
+            "message": (
+                "Low confidence — recommend in-person veterinary examination."
+                if is_uncertain else
+                "AI analysis complete."
+            )
+        })
+    finally:
+        if os.path.exists(temp_filepath):
+            os.remove(temp_filepath)
 
 
 @app.route('/uploads/<filename>', methods=['GET'])
