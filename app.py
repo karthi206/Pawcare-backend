@@ -209,7 +209,7 @@ def home():
 
 
 @app.route('/upload', methods=['POST'])
-@jwt_required()
+@jwt_required(optional=True)
 def upload():
     user_id = get_jwt_identity()
 
@@ -263,7 +263,7 @@ def upload():
         confidence=result["confidence"],
         is_uncertain=is_uncertain,
         location=location,
-        reported_by_id=int(user_id),
+        reported_by_id=int(user_id) if user_id else None,
     )
     db.session.add(new_case)
     db.session.commit()
