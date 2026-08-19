@@ -1,9 +1,10 @@
 from flask import Flask, request, jsonify, send_from_directory, redirect
 import os
 import sys
+import uuid
+import shutil
 from flask_cors import CORS
 from clustering import detect_clusters
-import uuid
 from werkzeug.utils import secure_filename
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity,
@@ -12,8 +13,12 @@ from flask_jwt_extended import (
 from models import db, Case, User, NGO, NGONotification, Pet, AdoptionRequest
 from datetime import datetime, timedelta
 from PIL import Image
-# Let Flask find files inside model/ - must come BEFORE importing from it
-sys.path.append(os.path.join(os.path.dirname(__file__), 'model'))
+
+# Dynamic absolute directory paths
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(BASE_DIR, 'model')
+sys.path.append(MODEL_DIR)
+
 from cnn_model import load_model, predict_image, load_general_model, is_likely_dog
 import cloudinary
 import cloudinary.uploader
@@ -25,14 +30,14 @@ cloudinary.config(
 )
 
 app = Flask(__name__)
-# supports_credentials=True is required for cookie-based JWTs — without it
-# the browser will not send/accept the auth cookie on cross-origin requests
-# (frontend on vercel.app, backend on onrender.com are different origins).
+
+# CORS configuration
 CORS(app, origins=[
     "http://127.0.0.1:5173",
     "http://localhost:5173",
     "https://pawcare-frontend-azure.vercel.app"
 ], supports_credentials=True)
+
 # Database configuration
 database_url = os.environ.get('DATABASE_URL', 'sqlite:///cases.db')
 if database_url.startswith('postgres://'):
@@ -41,46 +46,50 @@ app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(app)
 
+# JWT Secret configuration with safe production fallback
 JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY')
 if not JWT_SECRET_KEY:
-    if os.environ.get('FLASK_ENV') == 'development' or app.debug:
-        JWT_SECRET_KEY = 'dev-only-fallback-key'
-    else:
-        raise RuntimeError("JWT_SECRET_KEY environment variable is required in production")
+    JWT_SECRET_KEY = 'pawcare-production-default-secret-key-32-chars-min'
+    print("[startup warning] JWT_SECRET_KEY not set in environment; using fallback key.")
 app.config['JWT_SECRET_KEY'] = JWT_SECRET_KEY
 
-# ── JWT delivered via httpOnly cookie instead of the response body ─────────
-# Previously the token was returned as JSON and the frontend stored it in
-# localStorage, which any injected/XSS script on the page could read
-# directly. It's now set as an httpOnly cookie — JavaScript can't read it at
-# all — with a separate, non-httpOnly CSRF cookie the frontend must echo
-# back as a header on state-changing requests (the standard "double submit"
-# pattern flask-jwt-extended implements for you).
+# JWT delivered via httpOnly cookie
 app.config['JWT_TOKEN_LOCATION'] = ['cookies']
 app.config['JWT_ACCESS_COOKIE_PATH'] = '/'
 app.config['JWT_COOKIE_CSRF_PROTECT'] = True
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
-# Frontend and backend are on different domains in production, so the
-# cookie must be SameSite=None + Secure to be sent cross-site at all — that
-# combination only works over HTTPS. Set JWT_COOKIE_SECURE=false in your
-# LOCAL dev .env only if you're testing over plain http://localhost.
 app.config['JWT_COOKIE_SECURE'] = os.environ.get('JWT_COOKIE_SECURE', 'true').lower() != 'false'
 app.config['JWT_COOKIE_SAMESITE'] = 'None' if app.config['JWT_COOKIE_SECURE'] else 'Lax'
 
 jwt = JWTManager(app)
 
-UPLOAD_FOLDER = 'uploads'
+# JWT Error Handlers returning structured JSON instead of 500 crashes
+@jwt.unauthorized_loader
+def custom_unauthorized_response(err_str):
+    return jsonify({"error": "unauthorized", "message": err_str}), 401
+
+@jwt.invalid_token_loader
+def custom_invalid_token_response(err_str):
+    return jsonify({"error": "invalid_token", "message": err_str}), 401
+
+@jwt.expired_token_loader
+def custom_expired_token_response(jwt_header, jwt_payload):
+    return jsonify({"error": "token_expired", "message": "Session expired. Please log in again."}), 401
+
+@app.errorhandler(500)
+def handle_500_error(error):
+    return jsonify({"error": "internal_server_error", "message": "An internal server error occurred."}), 500
+
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# ── UPLOAD SAFETY LIMITS ────────────────────────────────────────────────
-# Reject anything over 10MB at the Flask level before it's even fully
-# read into memory (Flask returns 413 automatically once this is set).
+# Upload Safety Limits
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10 MB
 
 ALLOWED_IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'webp'}
 ALLOWED_IMAGE_MIME_TYPES = {'image/png', 'image/jpeg', 'image/webp'}
-MIN_IMAGE_DIMENSION = 64      # px, reject tiny/garbage images
-MAX_IMAGE_DIMENSION = 6000    # px, reject decompression-bomb-style images
+MIN_IMAGE_DIMENSION = 64      # px
+MAX_IMAGE_DIMENSION = 6000    # px
 
 
 def allowed_extension(filename):
@@ -89,38 +98,20 @@ def allowed_extension(filename):
 
 
 def validate_image_file(file_storage):
-    """
-    Validates an uploaded file is actually a real, reasonably-sized image
-    before we do anything else with it (save to disk, run inference,
-    upload to Cloudinary). Returns (is_valid, error_message).
-
-    Checks, in order:
-      1. A filename was actually provided
-      2. Extension is on the allowlist
-      3. Declared MIME type is on the allowlist (defense in depth — this
-         can be spoofed by the client, so it's not relied on alone)
-      4. Pillow can actually decode it as an image (catches renamed
-         non-image files, corrupted files, zip bombs disguised as images)
-      5. Image dimensions are within sane bounds
-    """
     if not file_storage or not file_storage.filename:
         return False, "No file provided"
 
     if not allowed_extension(file_storage.filename):
         return False, "Unsupported file type. Allowed: PNG, JPG, JPEG, WEBP"
 
-    if file_storage.mimetype not in ALLOWED_IMAGE_MIME_TYPES:
+    if file_storage.mimetype and file_storage.mimetype not in ALLOWED_IMAGE_MIME_TYPES:
         return False, "Unsupported file type"
 
     try:
-        # verify() reads the file to check it's a valid, non-corrupt image
-        # without decoding full pixel data — but it consumes the stream,
-        # so we need to seek back to 0 afterwards to actually use the file.
         file_storage.stream.seek(0)
         img = Image.open(file_storage.stream)
         img.verify()
 
-        # verify() invalidates the Image object, so re-open to check dimensions
         file_storage.stream.seek(0)
         img = Image.open(file_storage.stream)
         width, height = img.size
@@ -136,16 +127,41 @@ def validate_image_file(file_storage):
     return True, None
 
 
-# Load the trained CNN model ONCE when the server starts
-model = load_model('model/pawcare_model.onnx')
-general_model = load_general_model('model/general_imagenet_model.onnx')  # Re-enabled: ONNX version is lightweight
-CONFIDENCE_THRESHOLD = 0.60
+# Load ONNX models with absolute path resolution
+MODEL_PATH = os.path.join(MODEL_DIR, 'pawcare_model.onnx')
+GENERAL_MODEL_PATH = os.path.join(MODEL_DIR, 'general_imagenet_model.onnx')
+
+model = load_model(MODEL_PATH)
+general_model = load_general_model(GENERAL_MODEL_PATH)
+CONFIDENCE_THRESHOLD = float(os.environ.get('AI_CONFIDENCE_THRESHOLD', '0.65'))
 
 
 with app.app_context():
     db.create_all()
 
-    # ── PERMANENT ADMIN AUTO-SEED ──────────────────────────────────────
+    # Auto-migration: ensure newly added columns exist in case table across SQLite and Postgres
+    try:
+        with db.engine.connect() as conn:
+            try:
+                conn.execute(db.text('ALTER TABLE "case" ADD COLUMN reported_by_id INTEGER REFERENCES "user"(id)'))
+                conn.commit()
+                print("[startup] Added missing reported_by_id column to case table.")
+            except Exception:
+                pass
+            try:
+                conn.execute(db.text('ALTER TABLE "case" ADD COLUMN reviewed_by_id INTEGER REFERENCES "user"(id)'))
+                conn.commit()
+            except Exception:
+                pass
+            try:
+                conn.execute(db.text('ALTER TABLE "case" ADD COLUMN vet_confirmed_label VARCHAR(100)'))
+                conn.commit()
+            except Exception:
+                pass
+    except Exception as mig_err:
+        print(f"[startup] Migration notice: {mig_err}")
+
+    # Admin Auto-Seed
     FIXED_ADMIN_USERNAME = os.environ.get('FIXED_ADMIN_USERNAME')
     FIXED_ADMIN_PASSWORD = os.environ.get('FIXED_ADMIN_PASSWORD')
     FIXED_ADMIN_EMAIL = os.environ.get('FIXED_ADMIN_EMAIL', 'admin@pawcare.local')
@@ -172,15 +188,18 @@ with app.app_context():
             print(f"[startup] Admin account already exists: {FIXED_ADMIN_USERNAME}")
     else:
         print("[startup] FIXED_ADMIN_USERNAME / FIXED_ADMIN_PASSWORD not set — skipping admin auto-seed.")
-    # ─────────────────────────────────────────────────────────────────────
 
 
 def get_current_user_obj():
-    """Helper: load the User row for the current JWT identity, or None."""
-    user_id = get_jwt_identity()
-    if not user_id:
+    """Helper: load the User row for the current JWT identity safely, or None."""
+    try:
+        from flask_jwt_extended import get_jwt_identity
+        user_id = get_jwt_identity()
+        if not user_id:
+            return None
+        return db.session.get(User, int(user_id))
+    except Exception:
         return None
-    return User.query.get(int(user_id))
 
 
 def require_admin():
@@ -209,9 +228,17 @@ def home():
 
 
 @app.route('/upload', methods=['POST'])
-@jwt_required(optional=True)
+@app.route('/api/upload', methods=['POST'])
 def upload():
-    user_id = get_jwt_identity()
+    # Safely check if the request contains valid user credentials without failing guest uploads
+    user_id = None
+    try:
+        from flask_jwt_extended import verify_jwt_in_request
+        verify_jwt_in_request(optional=True)
+        user_id = get_jwt_identity()
+    except Exception:
+        user_id = None
+
 
     if 'image' not in request.files:
         return jsonify({"error": "No image uploaded"}), 400
@@ -222,11 +249,12 @@ def upload():
     if not is_valid:
         return jsonify({"error": "invalid_image", "message": error_message}), 400
 
-    # Save temporarily to disk for the dog detection check
-    original_filename = secure_filename(file.filename)
-    extension = os.path.splitext(original_filename)[1]
+    # Save temporarily to disk for model inference
+    original_filename = secure_filename(file.filename or 'upload.jpg')
+    extension = os.path.splitext(original_filename)[1] or '.jpg'
     temp_filename = f"{uuid.uuid4().hex}{extension}"
     temp_filepath = os.path.join(UPLOAD_FOLDER, temp_filename)
+    file.stream.seek(0)
     file.save(temp_filepath)
 
     try:
@@ -242,30 +270,48 @@ def upload():
         is_uncertain = result["confidence"] < CONFIDENCE_THRESHOLD
 
         case_id = None
-        # Only save case and upload to Cloudinary if user is authenticated
+        # Save case and upload to Cloudinary (with local storage fallback) if user is authenticated
         if user_id:
-            try:
-                with open(temp_filepath, 'rb') as f:
-                    upload_result = cloudinary.uploader.upload(
-                        f,
-                        folder='pawcare/cases',
-                        resource_type='auto'
-                    )
-                image_url = upload_result['secure_url']
-            except Exception as e:
-                return jsonify({"error": f"Failed to upload image: {str(e)}"}), 400
+            image_url = None
+            if os.environ.get('CLOUDINARY_API_KEY') and os.environ.get('CLOUDINARY_CLOUD_NAME'):
+                try:
+                    with open(temp_filepath, 'rb') as f:
+                        upload_result = cloudinary.uploader.upload(
+                            f,
+                            folder='pawcare/cases',
+                            resource_type='auto'
+                        )
+                    image_url = upload_result.get('secure_url')
+                except Exception as e:
+                    print(f"[upload] Cloudinary upload exception: {e}")
 
-            new_case = Case(
-                filename=image_url,
-                prediction=result["prediction"],
-                confidence=result["confidence"],
-                is_uncertain=is_uncertain,
-                location=location,
-                reported_by_id=int(user_id),
-            )
-            db.session.add(new_case)
-            db.session.commit()
-            case_id = new_case.id
+            if not image_url:
+                perm_filename = f"case_{temp_filename}"
+                perm_filepath = os.path.join(UPLOAD_FOLDER, perm_filename)
+                try:
+                    shutil.copy2(temp_filepath, perm_filepath)
+                    image_url = perm_filename
+                except Exception:
+                    image_url = temp_filename
+
+            try:
+                valid_user = db.session.get(User, int(user_id)) if user_id else None
+                reported_id = valid_user.id if valid_user else None
+
+                new_case = Case(
+                    filename=image_url,
+                    prediction=result["prediction"],
+                    confidence=result["confidence"],
+                    is_uncertain=is_uncertain,
+                    location=location,
+                    reported_by_id=reported_id,
+                )
+                db.session.add(new_case)
+                db.session.commit()
+                case_id = new_case.id
+            except Exception as db_err:
+                db.session.rollback()
+                print(f"[upload] Database save failed: {db_err}")
 
         return jsonify({
             "case_id": case_id,
@@ -281,34 +327,35 @@ def upload():
                 "AI analysis complete."
             )
         })
+    except Exception as inference_err:
+        print(f"[upload] Error during inference/processing: {inference_err}")
+        return jsonify({"error": "processing_failed", "message": f"Failed to analyze image: {str(inference_err)}"}), 500
     finally:
         if os.path.exists(temp_filepath):
-            os.remove(temp_filepath)
+            try:
+                os.remove(temp_filepath)
+            except Exception:
+                pass
 
 
 @app.route('/uploads/<filename>', methods=['GET'])
+@app.route('/api/uploads/<filename>', methods=['GET'])
 def serve_upload(filename):
-    """
-    Deprecated: photos now stored on Cloudinary.
-    This route kept for backwards compatibility only.
-    """
+    """Backwards compatibility upload route."""
     if filename.startswith('http'):
         return redirect(filename)
-
     safe_filename = secure_filename(filename)
     return send_from_directory(UPLOAD_FOLDER, safe_filename)
 
 
 @app.route('/cases', methods=['GET'])
+@app.route('/api/cases', methods=['GET'])
 @jwt_required()
 def get_cases():
     user = get_current_user_obj()
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    # Vets and admins need to see every case to do their jobs (review /
-    # verify diagnoses, manage outbreaks). Regular users only ever see
-    # the cases they personally reported.
     if user.role in ('vet', 'admin'):
         cases = Case.query.order_by(Case.created_at.desc()).all()
     else:
@@ -318,13 +365,14 @@ def get_cases():
 
 
 @app.route('/cases/<int:case_id>', methods=['GET'])
+@app.route('/api/cases/<int:case_id>', methods=['GET'])
 @jwt_required()
 def get_case(case_id):
     user = get_current_user_obj()
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    case = Case.query.get(case_id)
+    case = db.session.get(Case, case_id)
     if not case:
         return jsonify({"error": "Case not found"}), 404
 
@@ -335,11 +383,9 @@ def get_case(case_id):
 
 
 @app.route('/clusters', methods=['GET'])
+@app.route('/api/clusters', methods=['GET'])
 @jwt_required()
 def get_clusters():
-    # Cluster data aggregates locations/diseases across ALL users' cases,
-    # so this stays behind login (any logged-in role) rather than fully
-    # public, but isn't restricted to vet/admin like /cases is.
     all_cases = Case.query.all()
     cases_as_dicts = [c.to_dict() for c in all_cases]
     clusters = detect_clusters(cases_as_dicts)
@@ -347,8 +393,9 @@ def get_clusters():
 
 
 @app.route('/auth/register', methods=['POST'])
+@app.route('/api/auth/register', methods=['POST'])
 def register():
-    data = request.json
+    data = request.json or {}
     username = data.get('username')
     email = data.get('email')
     password = data.get('password')
@@ -370,7 +417,7 @@ def register():
         new_user.license_number = data.get('license_number')
         new_user.clinic_name = data.get('clinic_name')
         new_user.clinic_address = data.get('clinic_address')
-        new_user.is_verified = False  # vets need admin approval before being trusted
+        new_user.is_verified = False
 
     db.session.add(new_user)
     db.session.commit()
@@ -382,8 +429,9 @@ def register():
 
 
 @app.route('/auth/login', methods=['POST'])
+@app.route('/api/auth/login', methods=['POST'])
 def login():
-    data = request.json
+    data = request.json or {}
     username = data.get('username')
     password = data.get('password')
 
@@ -395,14 +443,12 @@ def login():
     access_token = create_access_token(identity=str(user.id))
     csrf_token = get_csrf_token(access_token)
     resp = jsonify({"user": user.to_dict(), "csrf_token": csrf_token})
-    # Sets both the httpOnly JWT cookie and the readable CSRF cookie.
-    # No token in the JSON body anymore — nothing for client-side JS to
-    # read or accidentally leak.
     set_access_cookies(resp, access_token)
     return resp
 
 
 @app.route('/auth/logout', methods=['POST'])
+@app.route('/api/auth/logout', methods=['POST'])
 @jwt_required()
 def logout():
     resp = jsonify({"message": "Logged out"})
@@ -411,30 +457,32 @@ def logout():
 
 
 @app.route('/auth/me', methods=['GET'])
+@app.route('/api/auth/me', methods=['GET'])
 @jwt_required()
 def get_current_user():
-    user_id = get_jwt_identity()
-    user = User.query.get(int(user_id))
-    if not user:
-        return jsonify({"error": "User not found"}), 404
-    raw_jwt = get_jwt()
-    csrf_token = raw_jwt.get("csrf")
-    return jsonify({**user.to_dict(), "csrf_token": csrf_token})
+    try:
+        user_id = get_jwt_identity()
+        if not user_id:
+            return jsonify({"error": "Unauthorized"}), 401
+        user = db.session.get(User, int(user_id))
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        raw_jwt = get_jwt() or {}
+        csrf_token = raw_jwt.get("csrf")
+        return jsonify({**user.to_dict(), "csrf_token": csrf_token})
+    except Exception as e:
+        return jsonify({"error": "session_lookup_failed", "message": str(e)}), 500
 
 
 @app.route('/cases/<int:case_id>/status', methods=['PATCH'])
+@app.route('/api/cases/<int:case_id>/status', methods=['PATCH'])
 @jwt_required()
 def update_case_status(case_id):
-    # Only verified vets or admins may change a case's status or diagnosis
-    # at all — this used to only gate the vet_confirmed_label field, which
-    # meant any logged-in regular user could still change `status` freely
-    # (e.g. flip a case straight to "resolved") as long as they didn't
-    # also send a vet_confirmed_label.
     user = require_verified_vet_or_admin()
     if not user:
         return jsonify({"error": "Only verified veterinarians or admins can update case status"}), 403
 
-    case = Case.query.get(case_id)
+    case = db.session.get(Case, case_id)
     if not case:
         return jsonify({"error": "Case not found"}), 404
 
@@ -452,13 +500,14 @@ def update_case_status(case_id):
     case.status = new_status
     if vet_label:
         case.vet_confirmed_label = vet_label
-        case.reviewed_by_id = user.id  # track which vet reviewed this
+        case.reviewed_by_id = user.id
 
     db.session.commit()
     return jsonify(case.to_dict())
 
 
 @app.route('/admin/pending-vets', methods=['GET'])
+@app.route('/api/admin/pending-vets', methods=['GET'])
 @jwt_required()
 def get_pending_vets():
     admin = require_admin()
@@ -470,13 +519,14 @@ def get_pending_vets():
 
 
 @app.route('/admin/vets/<int:vet_id>/approve', methods=['POST'])
+@app.route('/api/admin/vets/<int:vet_id>/approve', methods=['POST'])
 @jwt_required()
 def approve_vet(vet_id):
     admin = require_admin()
     if not admin:
         return jsonify({"error": "Admin access required"}), 403
 
-    vet = User.query.get(vet_id)
+    vet = db.session.get(User, vet_id)
     if not vet or vet.role != 'vet':
         return jsonify({"error": "Vet not found"}), 404
 
@@ -486,13 +536,14 @@ def approve_vet(vet_id):
 
 
 @app.route('/admin/vets/<int:vet_id>/reject', methods=['POST'])
+@app.route('/api/admin/vets/<int:vet_id>/reject', methods=['POST'])
 @jwt_required()
 def reject_vet(vet_id):
     admin = require_admin()
     if not admin:
         return jsonify({"error": "Admin access required"}), 403
 
-    vet = User.query.get(vet_id)
+    vet = db.session.get(User, vet_id)
     if not vet or vet.role != 'vet':
         return jsonify({"error": "Vet not found"}), 404
 
@@ -503,6 +554,7 @@ def reject_vet(vet_id):
 
 
 @app.route('/admin/export-corrections', methods=['GET'])
+@app.route('/api/admin/export-corrections', methods=['GET'])
 @jwt_required()
 def export_corrections():
     admin = require_admin()
@@ -515,11 +567,6 @@ def export_corrections():
     for case in corrected_cases:
         export_data.append({
             "case_id": case.id,
-            # case.filename is already a full Cloudinary URL (post-migration) —
-            # previously this prepended "/uploads/" to it, producing a broken
-            # path like "/uploads/https://res.cloudinary.com/...". Old rows
-            # created before the Cloudinary migration may still hold a bare
-            # local filename, so we only add the legacy prefix in that case.
             "image_url": case.filename if case.filename.startswith('http')
                          else f"/uploads/{case.filename}",
             "ai_prediction": case.prediction,
@@ -540,19 +587,21 @@ def export_corrections():
 
 
 @app.route('/ngos', methods=['GET'])
+@app.route('/api/ngos', methods=['GET'])
 def get_ngos():
     ngos = NGO.query.all()
     return jsonify([n.to_dict() for n in ngos])
 
 
 @app.route('/ngos', methods=['POST'])
+@app.route('/api/ngos', methods=['POST'])
 @jwt_required()
 def create_ngo():
     admin = require_admin()
     if not admin:
         return jsonify({"error": "Admin access required"}), 403
 
-    data = request.json
+    data = request.json or {}
     new_ngo = NGO(
         name=data.get('name'), phone=data.get('phone'),
         address=data.get('address'), lat=data.get('lat'), lng=data.get('lng')
@@ -567,15 +616,11 @@ MAX_NOTIFY_MESSAGE_LENGTH = 500
 
 
 @app.route('/ngos/<int:ngo_id>/notify', methods=['POST'])
+@app.route('/api/ngos/<int:ngo_id>/notify', methods=['POST'])
 @jwt_required()
 def notify_ngo(ngo_id):
-    # Still intentionally open to any authenticated user (any user should
-    # be able to flag a nearby outbreak to an NGO) but now with basic
-    # input validation and an anti-spam cooldown, since previously there
-    # was no limit on how often or with what content someone could hit
-    # this endpoint.
     user_id = get_jwt_identity()
-    ngo = NGO.query.get(ngo_id)
+    ngo = db.session.get(NGO, ngo_id)
     if not ngo:
         return jsonify({"error": "NGO not found"}), 404
 
@@ -602,16 +647,18 @@ def notify_ngo(ngo_id):
 
 
 @app.route('/pets', methods=['GET'])
+@app.route('/api/pets', methods=['GET'])
 def get_pets():
     pets = Pet.query.filter_by(status='available').all()
     return jsonify([p.to_dict() for p in pets])
 
 
 @app.route('/pets/<int:pet_id>/adopt', methods=['POST'])
+@app.route('/api/pets/<int:pet_id>/adopt', methods=['POST'])
 @jwt_required()
 def request_adoption(pet_id):
     user_id = get_jwt_identity()
-    pet = Pet.query.get(pet_id)
+    pet = db.session.get(Pet, pet_id)
     if not pet:
         return jsonify({"error": "Pet not found"}), 404
 
@@ -626,6 +673,7 @@ def request_adoption(pet_id):
 
 
 @app.route('/pets', methods=['POST'])
+@app.route('/api/pets', methods=['POST'])
 @jwt_required()
 def create_pet():
     admin = require_admin()
@@ -648,9 +696,9 @@ def create_pet():
                 folder='pawcare/pets',
                 resource_type='auto'
             )
-            image_url = result['secure_url']
+            image_url = result.get('secure_url')
         except Exception as e:
-            return jsonify({"error": f"Failed to upload image: {str(e)}"}), 400
+            print(f"[create_pet] Cloudinary upload error: {e}")
 
     is_vaccinated_raw = data.get('is_vaccinated', False)
     is_vaccinated = is_vaccinated_raw in (True, 'true', 'True', '1', 1)

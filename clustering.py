@@ -23,17 +23,18 @@ Weighting scheme (tunable via WEIGHT_* constants below):
 prediction or the vet-confirmed label.
 """
 
+import os
 import math
 from datetime import datetime, timedelta
 
-RADIUS_KM = 1.0
-TIME_WINDOW_DAYS = 14
-MIN_WEIGHT = 2.0          # weighted score required to call it a cluster
-MIN_CASE_COUNT = 2        # still require at least 2 distinct cases
+RADIUS_KM = float(os.environ.get("OUTBREAK_RADIUS_KM", "1.0"))
+TIME_WINDOW_DAYS = int(os.environ.get("OUTBREAK_TIME_WINDOW_DAYS", "14"))
+MIN_WEIGHT = float(os.environ.get("OUTBREAK_MIN_WEIGHT", "2.0"))          # weighted score required to call it a cluster
+MIN_CASE_COUNT = int(os.environ.get("OUTBREAK_MIN_CASES", "2"))          # require at least 2 distinct cases
 
-WEIGHT_VET_CONFIRMED = 1.0
-WEIGHT_AI_CONFIDENT = 0.6
-WEIGHT_AI_UNCERTAIN = 0.25
+WEIGHT_VET_CONFIRMED = float(os.environ.get("WEIGHT_VET_CONFIRMED", "1.0"))
+WEIGHT_AI_CONFIDENT = float(os.environ.get("WEIGHT_AI_CONFIDENT", "0.6"))
+WEIGHT_AI_UNCERTAIN = float(os.environ.get("WEIGHT_AI_UNCERTAIN", "0.25"))
 
 EXCLUDED_LABELS = {'Healthy'}
 
