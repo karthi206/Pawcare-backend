@@ -19,6 +19,21 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, 'model')
 sys.path.append(MODEL_DIR)
 
+# Auto-load .env file if present
+ENV_PATH = os.path.join(BASE_DIR, '.env')
+if os.path.isfile(ENV_PATH):
+    try:
+        with open(ENV_PATH, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    k, v = k.strip(), v.strip().strip('"').strip("'")
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+    except Exception as env_err:
+        print(f"[startup] Notice reading .env: {env_err}")
+
 from cnn_model import load_model, predict_image, load_general_model, is_likely_dog
 import cloudinary
 import cloudinary.uploader
@@ -162,12 +177,14 @@ with app.app_context():
         print(f"[startup] Migration notice: {mig_err}")
 
     # Admin Auto-Seed
-    FIXED_ADMIN_USERNAME = os.environ.get('FIXED_ADMIN_USERNAME')
-    FIXED_ADMIN_PASSWORD = os.environ.get('FIXED_ADMIN_PASSWORD')
+    FIXED_ADMIN_USERNAME = os.environ.get('FIXED_ADMIN_USERNAME', 'admin')
+    FIXED_ADMIN_PASSWORD = os.environ.get('FIXED_ADMIN_PASSWORD', 'admin123')
     FIXED_ADMIN_EMAIL = os.environ.get('FIXED_ADMIN_EMAIL', 'admin@pawcare.local')
 
     if FIXED_ADMIN_USERNAME and FIXED_ADMIN_PASSWORD:
-        existing_admin = User.query.filter_by(username=FIXED_ADMIN_USERNAME).first()
+        existing_admin = User.query.filter(
+            (User.username == FIXED_ADMIN_USERNAME) | (User.email == FIXED_ADMIN_EMAIL)
+        ).first()
         if not existing_admin:
             new_admin = User(
                 username=FIXED_ADMIN_USERNAME,
@@ -179,13 +196,14 @@ with app.app_context():
             db.session.add(new_admin)
             db.session.commit()
             print(f"[startup] Created permanent admin account: {FIXED_ADMIN_USERNAME}")
-        elif existing_admin.role != 'admin':
+        else:
+            existing_admin.username = FIXED_ADMIN_USERNAME
+            existing_admin.email = FIXED_ADMIN_EMAIL
             existing_admin.role = 'admin'
             existing_admin.is_verified = True
+            existing_admin.set_password(FIXED_ADMIN_PASSWORD)
             db.session.commit()
-            print(f"[startup] Promoted existing account to admin: {FIXED_ADMIN_USERNAME}")
-        else:
-            print(f"[startup] Admin account already exists: {FIXED_ADMIN_USERNAME}")
+            print(f"[startup] Synchronized permanent admin account: {FIXED_ADMIN_USERNAME}")
     else:
         print("[startup] FIXED_ADMIN_USERNAME / FIXED_ADMIN_PASSWORD not set — skipping admin auto-seed.")
 
@@ -229,15 +247,11 @@ def home():
 
 @app.route('/upload', methods=['POST'])
 @app.route('/api/upload', methods=['POST'])
+@jwt_required()
 def upload():
-    # Safely check if the request contains valid user credentials without failing guest uploads
-    user_id = None
-    try:
-        from flask_jwt_extended import verify_jwt_in_request
-        verify_jwt_in_request(optional=True)
-        user_id = get_jwt_identity()
-    except Exception:
-        user_id = None
+    user_id = get_jwt_identity()
+    if not user_id:
+        return jsonify({"error": "unauthorized", "message": "Authentication required to upload images."}), 401
 
 
     if 'image' not in request.files:
@@ -396,10 +410,10 @@ def get_clusters():
 @app.route('/api/auth/register', methods=['POST'])
 def register():
     data = request.json or {}
-    username = data.get('username')
-    email = data.get('email')
+    username = (data.get('username') or '').strip()
+    email = (data.get('email') or '').strip().lower()
     password = data.get('password')
-    role = data.get('role', 'user')
+    role = (data.get('role') or 'user').strip().lower()
 
     if not username or not email or not password:
         return jsonify({"error": "username, email, and password are required"}), 400
@@ -432,16 +446,24 @@ def register():
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     data = request.json or {}
-    username = data.get('username')
+    identifier = (data.get('username') or data.get('email') or '').strip()
     password = data.get('password')
 
-    user = User.query.filter_by(username=username).first()
+    if not identifier or not password:
+        return jsonify({"error": "Username and password are required"}), 400
+
+    user = User.query.filter(
+        (User.username == identifier) | (User.email == identifier.lower())
+    ).first()
 
     if not user or not user.check_password(password):
         return jsonify({"error": "Invalid username or password"}), 401
 
     access_token = create_access_token(identity=str(user.id))
-    csrf_token = get_csrf_token(access_token)
+    try:
+        csrf_token = get_csrf_token(access_token)
+    except Exception:
+        csrf_token = None
     resp = jsonify({"user": user.to_dict(), "csrf_token": csrf_token})
     set_access_cookies(resp, access_token)
     return resp
@@ -490,14 +512,19 @@ def update_case_status(case_id):
     new_status = data.get('status')
     vet_label = data.get('vet_confirmed_label')
 
-    if new_status not in ['pending', 'vet_confirmed', 'resolved']:
+    VALID_STATUSES = ['pending', 'vet_confirmed', 'resolved']
+    if new_status and new_status not in VALID_STATUSES:
         return jsonify({"error": "Invalid status"}), 400
 
     VALID_DISEASES = ['Dermatitis', 'Fungal_infections', 'Healthy', 'Hypersensitivity', 'demodicosis', 'ringworm']
     if vet_label and vet_label not in VALID_DISEASES:
         return jsonify({"error": "Invalid disease label"}), 400
 
-    case.status = new_status
+    if new_status:
+        case.status = new_status
+    elif vet_label:
+        case.status = 'vet_confirmed'
+
     if vet_label:
         case.vet_confirmed_label = vet_label
         case.reviewed_by_id = user.id
@@ -619,7 +646,11 @@ MAX_NOTIFY_MESSAGE_LENGTH = 500
 @app.route('/api/ngos/<int:ngo_id>/notify', methods=['POST'])
 @jwt_required()
 def notify_ngo(ngo_id):
-    user_id = get_jwt_identity()
+    admin = require_admin()
+    if not admin:
+        return jsonify({"error": "Admin access required to notify NGOs."}), 403
+
+    user_id = admin.id
     ngo = db.session.get(NGO, ngo_id)
     if not ngo:
         return jsonify({"error": "NGO not found"}), 404
