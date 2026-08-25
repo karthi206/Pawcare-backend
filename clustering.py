@@ -156,6 +156,12 @@ def detect_clusters(cases, radius_km=RADIUS_KM, time_window_days=TIME_WINDOW_DAY
 
             center_lat = sum(p['lat'] for p in group) / len(group)
             center_lon = sum(p['lon'] for p in group) / len(group)
+            vet_confirmed_count = sum(1 for p in group if p['is_vet_confirmed'])
+            is_confirmed = vet_confirmed_count > 0
+            cluster_type = "confirmed_outbreak" if is_confirmed else "possible_cluster"
+            title = f"Confirmed {label} Outbreak" if is_confirmed else f"Possible {label} Cluster"
+            confidence_level = "high" if is_confirmed else ("moderate" if weighted_score >= 2.5 else "low")
+
             clusters.append({
                 "disease": label,
                 "case_count": len(group),
@@ -163,11 +169,14 @@ def detect_clusters(cases, radius_km=RADIUS_KM, time_window_days=TIME_WINDOW_DAY
                 "center_lat": center_lat,
                 "center_lon": center_lon,
                 "weighted_score": round(weighted_score, 2),
-                "vet_confirmed_count": sum(1 for p in group if p['is_vet_confirmed']),
+                "vet_confirmed_count": vet_confirmed_count,
+                "cluster_type": cluster_type,
+                "title": title,
+                "confidence_level": confidence_level,
             })
 
     # Strongest evidence first
-    clusters.sort(key=lambda c: c['weighted_score'], reverse=True)
+    clusters.sort(key=lambda c: (c['vet_confirmed_count'] > 0, c['weighted_score']), reverse=True)
     return clusters
 
 

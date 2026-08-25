@@ -31,7 +31,7 @@ with app.app_context():
             filename=tc["filename"],
             prediction=tc["prediction"],
             confidence=tc["confidence"],
-            is_uncertain=tc["confidence"] < 0.60,
+            is_uncertain=tc["confidence"] < 0.65,
             location=tc["location"]
         )
         db.session.add(case)

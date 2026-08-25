@@ -1,3 +1,9 @@
+"""
+DEPRECATED / LEGACY MODULE:
+This feature extraction module (HOG + Color Histogram) was originally used for an early
+RandomForest baseline. The production architecture is now an end-to-end Deep CNN (MobileNetV2)
+trained via `train_model.py` and served via `cnn_model.py` with ONNX Runtime.
+"""
 import cv2
 import numpy as np
 from skimage.feature import hog

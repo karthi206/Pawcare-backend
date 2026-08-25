@@ -3,12 +3,34 @@ import os
 import sys
 import uuid
 import shutil
+import math
+import json
+import urllib.request
+import urllib.parse
 from flask_cors import CORS
 from clustering import detect_clusters
 from werkzeug.utils import secure_filename
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity,
     set_access_cookies, unset_jwt_cookies, get_csrf_token, get_jwt,
+)
+from jwt.exceptions import (
+    PyJWTError,
+    InvalidTokenError,
+    ExpiredSignatureError,
+    DecodeError,
+)
+from flask_jwt_extended.exceptions import (
+    JWTExtendedException,
+    CSRFError,
+    NoAuthorizationError,
+    InvalidHeaderError,
+    InvalidQueryParamError,
+    JWTDecodeError,
+    RevokedTokenError,
+    FreshTokenRequired,
+    UserLookupError,
+    WrongTokenError,
 )
 from models import db, Case, User, NGO, NGONotification, Pet, AdoptionRequest
 from datetime import datetime, timedelta
@@ -68,8 +90,8 @@ if not JWT_SECRET_KEY:
     print("[startup warning] JWT_SECRET_KEY not set in environment; using fallback key.")
 app.config['JWT_SECRET_KEY'] = JWT_SECRET_KEY
 
-# JWT delivered via httpOnly cookie
-app.config['JWT_TOKEN_LOCATION'] = ['cookies']
+# JWT delivered via httpOnly cookie (and supports Authorization header)
+app.config['JWT_TOKEN_LOCATION'] = ['cookies', 'headers']
 app.config['JWT_ACCESS_COOKIE_PATH'] = '/'
 app.config['JWT_COOKIE_CSRF_PROTECT'] = True
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
@@ -78,18 +100,77 @@ app.config['JWT_COOKIE_SAMESITE'] = 'None' if app.config['JWT_COOKIE_SECURE'] el
 
 jwt = JWTManager(app)
 
-# JWT Error Handlers returning structured JSON instead of 500 crashes
+# Flask-JWT-Extended Loader Callbacks returning structured JSON instead of 500 crashes
 @jwt.unauthorized_loader
 def custom_unauthorized_response(err_str):
-    return jsonify({"error": "unauthorized", "message": err_str}), 401
+    return jsonify({"error": "unauthorized", "message": err_str or "Missing or invalid authorization token."}), 401
 
 @jwt.invalid_token_loader
 def custom_invalid_token_response(err_str):
-    return jsonify({"error": "invalid_token", "message": err_str}), 401
+    return jsonify({"error": "invalid_token", "message": err_str or "Invalid token."}), 401
 
 @jwt.expired_token_loader
-def custom_expired_token_response(jwt_header, jwt_payload):
+def custom_expired_token_response(jwt_header=None, jwt_payload=None):
     return jsonify({"error": "token_expired", "message": "Session expired. Please log in again."}), 401
+
+@jwt.needs_fresh_token_loader
+def custom_needs_fresh_token_response(jwt_header=None, jwt_payload=None):
+    return jsonify({"error": "fresh_token_required", "message": "Fresh token required. Please log in again."}), 401
+
+@jwt.revoked_token_loader
+def custom_revoked_token_response(jwt_header=None, jwt_payload=None):
+    return jsonify({"error": "token_revoked", "message": "Token has been revoked. Please log in again."}), 401
+
+@jwt.token_verification_failed_loader
+def custom_token_verification_failed_response(jwt_header=None, jwt_payload=None):
+    return jsonify({"error": "token_verification_failed", "message": "User claims verification failed."}), 400
+
+@jwt.user_lookup_error_loader
+def custom_user_lookup_error_response(jwt_header=None, jwt_payload=None):
+    return jsonify({"error": "user_lookup_failed", "message": "User associated with token not found."}), 401
+
+
+# Global Exception Handlers for JWT, PyJWT, and CSRF Exceptions to prevent 500 crashes
+@app.errorhandler(ExpiredSignatureError)
+def handle_expired_signature_error(e):
+    return jsonify({"error": "token_expired", "message": "Session expired. Please log in again."}), 401
+
+@app.errorhandler(CSRFError)
+def handle_csrf_error(e):
+    return jsonify({"error": "csrf_error", "message": str(e) or "CSRF token validation failed."}), 401
+
+@app.errorhandler(NoAuthorizationError)
+def handle_no_authorization_error(e):
+    return jsonify({"error": "unauthorized", "message": str(e) or "Authorization required."}), 401
+
+@app.errorhandler(InvalidTokenError)
+@app.errorhandler(DecodeError)
+@app.errorhandler(JWTDecodeError)
+@app.errorhandler(InvalidHeaderError)
+@app.errorhandler(InvalidQueryParamError)
+@app.errorhandler(WrongTokenError)
+def handle_invalid_token_error(e):
+    return jsonify({"error": "invalid_token", "message": str(e) or "Invalid token."}), 401
+
+@app.errorhandler(RevokedTokenError)
+def handle_revoked_token_error(e):
+    return jsonify({"error": "token_revoked", "message": "Token has been revoked. Please log in again."}), 401
+
+@app.errorhandler(FreshTokenRequired)
+def handle_fresh_token_error(e):
+    return jsonify({"error": "fresh_token_required", "message": "Fresh token required. Please log in again."}), 401
+
+@app.errorhandler(UserLookupError)
+def handle_user_lookup_error(e):
+    return jsonify({"error": "user_lookup_failed", "message": str(e) or "User lookup failed."}), 401
+
+@app.errorhandler(JWTExtendedException)
+def handle_jwt_extended_exception(e):
+    return jsonify({"error": "invalid_token", "message": str(e) or "Token validation failed."}), 401
+
+@app.errorhandler(PyJWTError)
+def handle_pyjwt_error(e):
+    return jsonify({"error": "invalid_token", "message": str(e) or "Token decoding failed."}), 401
 
 @app.errorhandler(500)
 def handle_500_error(error):
@@ -284,7 +365,7 @@ def upload():
         is_uncertain = result["confidence"] < CONFIDENCE_THRESHOLD
 
         case_id = None
-        # Save case and upload to Cloudinary (with local storage fallback) if user is authenticated
+        # Save case and upload to Cloudinary (Cloudinary-only storage, no local disk fallback)
         if user_id:
             image_url = None
             if os.environ.get('CLOUDINARY_API_KEY') and os.environ.get('CLOUDINARY_CLOUD_NAME'):
@@ -298,15 +379,14 @@ def upload():
                     image_url = upload_result.get('secure_url')
                 except Exception as e:
                     print(f"[upload] Cloudinary upload exception: {e}")
+            else:
+                print("[upload] Cloudinary credentials missing in environment")
 
             if not image_url:
-                perm_filename = f"case_{temp_filename}"
-                perm_filepath = os.path.join(UPLOAD_FOLDER, perm_filename)
-                try:
-                    shutil.copy2(temp_filepath, perm_filepath)
-                    image_url = perm_filename
-                except Exception:
-                    image_url = temp_filename
+                return jsonify({
+                    "error": "image_storage_failed",
+                    "message": "Image storage failed, please try again."
+                }), 502
 
             try:
                 valid_user = db.session.get(User, int(user_id)) if user_id else None
@@ -326,6 +406,10 @@ def upload():
             except Exception as db_err:
                 db.session.rollback()
                 print(f"[upload] Database save failed: {db_err}")
+                return jsonify({
+                    "error": "database_error",
+                    "message": "Failed to record case data."
+                }), 500
 
         return jsonify({
             "case_id": case_id,
@@ -364,13 +448,12 @@ def serve_upload(filename):
 
 @app.route('/cases', methods=['GET'])
 @app.route('/api/cases', methods=['GET'])
-@jwt_required()
+@jwt_required(optional=True)
 def get_cases():
     user = get_current_user_obj()
     if not user:
-        return jsonify({"error": "User not found"}), 404
-
-    if user.role in ('vet', 'admin'):
+        cases = Case.query.order_by(Case.created_at.desc()).all()
+    elif user.role in ('vet', 'admin'):
         cases = Case.query.order_by(Case.created_at.desc()).all()
     else:
         cases = Case.query.filter_by(reported_by_id=user.id).order_by(Case.created_at.desc()).all()
@@ -380,17 +463,14 @@ def get_cases():
 
 @app.route('/cases/<int:case_id>', methods=['GET'])
 @app.route('/api/cases/<int:case_id>', methods=['GET'])
-@jwt_required()
+@jwt_required(optional=True)
 def get_case(case_id):
     user = get_current_user_obj()
-    if not user:
-        return jsonify({"error": "User not found"}), 404
-
     case = db.session.get(Case, case_id)
     if not case:
         return jsonify({"error": "Case not found"}), 404
 
-    if user.role not in ('vet', 'admin') and case.reported_by_id != user.id:
+    if user and user.role not in ('vet', 'admin') and case.reported_by_id != user.id:
         return jsonify({"error": "You don't have access to this case"}), 403
 
     return jsonify(case.to_dict())
@@ -398,7 +478,7 @@ def get_case(case_id):
 
 @app.route('/clusters', methods=['GET'])
 @app.route('/api/clusters', methods=['GET'])
-@jwt_required()
+@jwt_required(optional=True)
 def get_clusters():
     all_cases = Case.query.all()
     cases_as_dicts = [c.to_dict() for c in all_cases]
@@ -445,7 +525,7 @@ def register():
 @app.route('/auth/login', methods=['POST'])
 @app.route('/api/auth/login', methods=['POST'])
 def login():
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
     identifier = (data.get('username') or data.get('email') or '').strip()
     password = data.get('password')
 
@@ -471,7 +551,6 @@ def login():
 
 @app.route('/auth/logout', methods=['POST'])
 @app.route('/api/auth/logout', methods=['POST'])
-@jwt_required()
 def logout():
     resp = jsonify({"message": "Logged out"})
     unset_jwt_cookies(resp)
@@ -485,15 +564,19 @@ def get_current_user():
     try:
         user_id = get_jwt_identity()
         if not user_id:
-            return jsonify({"error": "Unauthorized"}), 401
-        user = db.session.get(User, int(user_id))
+            return jsonify({"error": "unauthorized", "message": "Authentication required."}), 401
+        try:
+            user_id_int = int(user_id)
+        except (ValueError, TypeError):
+            return jsonify({"error": "invalid_token", "message": "Invalid token identity."}), 401
+        user = db.session.get(User, user_id_int)
         if not user:
-            return jsonify({"error": "User not found"}), 404
+            return jsonify({"error": "user_not_found", "message": "User not found."}), 404
         raw_jwt = get_jwt() or {}
         csrf_token = raw_jwt.get("csrf")
         return jsonify({**user.to_dict(), "csrf_token": csrf_token})
     except Exception as e:
-        return jsonify({"error": "session_lookup_failed", "message": str(e)}), 500
+        return jsonify({"error": "unauthorized", "message": str(e)}), 401
 
 
 @app.route('/cases/<int:case_id>/status', methods=['PATCH'])
@@ -613,11 +696,267 @@ def export_corrections():
     })
 
 
+def _haversine_distance(lat1, lon1, lat2, lon2):
+    """Calculate Haversine distance in kilometers between two GPS coordinates."""
+    r = 6371.0  # Earth's radius in km
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+    a = min(1.0, max(0.0, a))
+    return 2.0 * r * math.asin(math.sqrt(a))
+
+
 @app.route('/ngos', methods=['GET'])
 @app.route('/api/ngos', methods=['GET'])
 def get_ngos():
     ngos = NGO.query.all()
     return jsonify([n.to_dict() for n in ngos])
+
+
+@app.route('/ngos/nearby', methods=['GET'])
+@app.route('/api/ngos/nearby', methods=['GET'])
+def get_nearby_ngos():
+    lat_raw = request.args.get('lat')
+    lng_raw = request.args.get('lng')
+    radius_raw = request.args.get('radius_km')
+
+    if lat_raw is None or lng_raw is None:
+        return jsonify({
+            "error": "invalid_parameters",
+            "message": "Valid lat and lng query parameters are required"
+        }), 400
+
+    try:
+        lat = float(lat_raw)
+        lng = float(lng_raw)
+    except (ValueError, TypeError):
+        return jsonify({
+            "error": "invalid_parameters",
+            "message": "Valid lat and lng query parameters are required"
+        }), 400
+
+    if math.isnan(lat) or math.isinf(lat) or not (-90.0 <= lat <= 90.0):
+        return jsonify({
+            "error": "invalid_parameters",
+            "message": "Valid lat and lng query parameters are required"
+        }), 400
+
+    if math.isnan(lng) or math.isinf(lng) or not (-180.0 <= lng <= 180.0):
+        return jsonify({
+            "error": "invalid_parameters",
+            "message": "Valid lat and lng query parameters are required"
+        }), 400
+
+    radius_km = 50.0
+    if radius_raw is not None and str(radius_raw).strip() != '':
+        try:
+            radius_km = float(radius_raw)
+        except (ValueError, TypeError):
+            return jsonify({
+                "error": "invalid_parameters",
+                "message": "radius_km must be a positive number"
+            }), 400
+
+        if math.isnan(radius_km) or math.isinf(radius_km) or radius_km <= 0:
+            return jsonify({
+                "error": "invalid_parameters",
+                "message": "radius_km must be a positive number"
+            }), 400
+
+    ngos = NGO.query.all()
+    nearby_ngos = []
+    for ngo in ngos:
+        if ngo.lat is None or ngo.lng is None:
+            continue
+        dist = _haversine_distance(lat, lng, ngo.lat, ngo.lng)
+        if dist <= radius_km:
+            ngo_data = ngo.to_dict()
+            ngo_data["distance_km"] = round(dist, 2)
+            nearby_ngos.append(ngo_data)
+
+    nearby_ngos.sort(key=lambda x: x["distance_km"])
+    return jsonify(nearby_ngos)
+
+
+OVERPASS_CACHE = {}
+OVERPASS_CACHE_TTL = timedelta(minutes=10)
+MAX_OVERPASS_CACHE_ENTRIES = 200
+
+
+@app.route('/ngos/live-nearby', methods=['GET'])
+@app.route('/api/ngos/live-nearby', methods=['GET'])
+def get_live_nearby_ngos():
+    lat_raw = request.args.get('lat')
+    lng_raw = request.args.get('lng')
+    radius_raw = request.args.get('radius_km')
+
+    if lat_raw is None or lng_raw is None:
+        return jsonify({
+            "error": "invalid_parameters",
+            "message": "Valid lat and lng query parameters are required"
+        }), 400
+
+    try:
+        lat = float(lat_raw)
+        lng = float(lng_raw)
+    except (ValueError, TypeError):
+        return jsonify({
+            "error": "invalid_parameters",
+            "message": "Valid lat and lng query parameters are required"
+        }), 400
+
+    if math.isnan(lat) or math.isinf(lat) or not (-90.0 <= lat <= 90.0):
+        return jsonify({
+            "error": "invalid_parameters",
+            "message": "Valid lat and lng query parameters are required"
+        }), 400
+
+    if math.isnan(lng) or math.isinf(lng) or not (-180.0 <= lng <= 180.0):
+        return jsonify({
+            "error": "invalid_parameters",
+            "message": "Valid lat and lng query parameters are required"
+        }), 400
+
+    radius_km = 50.0
+    if radius_raw is not None and str(radius_raw).strip() != '':
+        try:
+            radius_km = float(radius_raw)
+        except (ValueError, TypeError):
+            return jsonify({
+                "error": "invalid_parameters",
+                "message": "radius_km must be a positive number"
+            }), 400
+
+        if math.isnan(radius_km) or math.isinf(radius_km) or radius_km <= 0:
+            return jsonify({
+                "error": "invalid_parameters",
+                "message": "radius_km must be a positive number"
+            }), 400
+
+    # Cap radius to 100km to avoid excessively large Overpass queries
+    radius_km = min(radius_km, 100.0)
+
+    # In-memory cache key based on rounded coordinates (~1.1km resolution)
+    cache_key = (round(lat, 2), round(lng, 2), round(radius_km, 1))
+    now = datetime.utcnow()
+
+    if cache_key in OVERPASS_CACHE:
+        cached_time, cached_data = OVERPASS_CACHE[cache_key]
+        if now - cached_time < OVERPASS_CACHE_TTL:
+            return jsonify(cached_data)
+
+    radius_meters = int(radius_km * 1000)
+    overpass_query = f"""
+    [out:json][timeout:15];
+    (
+      node["amenity"="animal_shelter"](around:{radius_meters},{lat},{lng});
+      node["amenity"="veterinary"](around:{radius_meters},{lat},{lng});
+      node["office"="ngo"](around:{radius_meters},{lat},{lng});
+      way["amenity"="animal_shelter"](around:{radius_meters},{lat},{lng});
+      way["amenity"="veterinary"](around:{radius_meters},{lat},{lng});
+      way["office"="ngo"](around:{radius_meters},{lat},{lng});
+    );
+    out center;
+    """
+
+    results = []
+    try:
+        post_data = urllib.parse.urlencode({"data": overpass_query}).encode("utf-8")
+        req = urllib.request.Request(
+            "https://overpass-api.de/api/interpreter",
+            data=post_data,
+            headers={
+                "User-Agent": "PawCareAI/1.0 (animal-welfare-locator)",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw_body = resp.read().decode("utf-8")
+            osm_data = json.loads(raw_body)
+            elements = osm_data.get("elements", [])
+            for el in elements:
+                el_lat = el.get("lat") or el.get("center", {}).get("lat")
+                el_lng = el.get("lon") or el.get("center", {}).get("lon")
+                if el_lat is None or el_lng is None:
+                    continue
+
+                tags = el.get("tags", {})
+                amenity = tags.get("amenity")
+                office = tags.get("office")
+                raw_name = (tags.get("name") or "").strip()
+
+                # Reliable tags: keep animal_shelter and veterinary as-is
+                if amenity == "animal_shelter":
+                    place_type = "animal_shelter"
+                    type_label = "Animal Shelter"
+                    street = tags.get("addr:street")
+                    name = raw_name or (f"{type_label} ({street})" if street else f"{type_label} (Unlisted Name)")
+                elif amenity == "veterinary":
+                    place_type = "veterinary"
+                    type_label = "Veterinary Clinic"
+                    street = tags.get("addr:street")
+                    name = raw_name or (f"{type_label} ({street})" if street else f"{type_label} (Unlisted Name)")
+                elif office == "ngo":
+                    # office=ngo is too generic (driving schools, unrelated trusts, generic placeholders).
+                    # Rule: Drop office=ngo with no name, and only keep if name contains an animal welfare keyword.
+                    if not raw_name:
+                        continue
+
+                    name_lower = raw_name.lower()
+                    animal_keywords = (
+                        'animal', 'animals', 'dog', 'dogs', 'cat', 'cats', 'pet', 'pets',
+                        'puppy', 'puppies', 'kitten', 'kittens', 'rescue', 'shelter',
+                        'veterinary', 'vet', 'wildlife', 'stray', 'strays', 'welfare',
+                        'spca', 'blue cross', 'paws', 'paw', 'canine', 'feline',
+                        'sanctuary', 'fauna', 'creature', 'creatures', 'humane',
+                        'gaushala', 'goshala', 'gau', 'jivdaya', 'jeevdaya', 'prani', 'ahimsa'
+                    )
+                    if not any(kw in name_lower for kw in animal_keywords):
+                        continue
+
+                    place_type = "ngo"
+                    type_label = "NGO / Rescue"
+                    name = raw_name
+                else:
+                    continue
+
+                addr_parts = [
+                    tags.get("addr:housenumber"),
+                    tags.get("addr:street"),
+                    tags.get("addr:city"),
+                    tags.get("addr:postcode")
+                ]
+                address = ", ".join([p for p in addr_parts if p]) or tags.get("address") or "Address not listed in OSM"
+                phone = tags.get("phone") or tags.get("contact:phone") or None
+
+                dist = _haversine_distance(lat, lng, el_lat, el_lng)
+                if dist <= radius_km:
+                    results.append({
+                        "id": f"osm_{el.get('type', 'node')}_{el.get('id')}",
+                        "name": name,
+                        "address": address,
+                        "phone": phone,
+                        "lat": el_lat,
+                        "lng": el_lng,
+                        "type": place_type,
+                        "source": "osm",
+                        "distance_km": round(dist, 2)
+                    })
+
+            results.sort(key=lambda x: x["distance_km"])
+    except Exception as exc:
+        print(f"[live-nearby] Overpass API request notice: {exc}")
+
+    # Cache successful results or empty results up to cache size limit
+    if len(OVERPASS_CACHE) >= MAX_OVERPASS_CACHE_ENTRIES:
+        # Clear older half of entries
+        keys_to_delete = list(OVERPASS_CACHE.keys())[:50]
+        for k in keys_to_delete:
+            OVERPASS_CACHE.pop(k, None)
+
+    OVERPASS_CACHE[cache_key] = (now, results)
+    return jsonify(results)
 
 
 @app.route('/ngos', methods=['POST'])
@@ -628,10 +967,41 @@ def create_ngo():
     if not admin:
         return jsonify({"error": "Admin access required"}), 403
 
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
+    name = (data.get('name') or '').strip()
+    phone = (data.get('phone') or '').strip()
+    address = (data.get('address') or '').strip()
+    lat_raw = data.get('lat')
+    lng_raw = data.get('lng')
+
+    if not name:
+        return jsonify({"error": "invalid_input", "message": "NGO name is required"}), 400
+    if not phone:
+        return jsonify({"error": "invalid_input", "message": "Phone number is required"}), 400
+    if not address:
+        return jsonify({"error": "invalid_input", "message": "Address is required"}), 400
+
+    if lat_raw is None or lng_raw is None:
+        return jsonify({"error": "invalid_input", "message": "Latitude and Longitude are required"}), 400
+
+    try:
+        lat = float(lat_raw)
+        lng = float(lng_raw)
+    except (ValueError, TypeError):
+        return jsonify({"error": "invalid_input", "message": "Latitude and Longitude must be valid numbers"}), 400
+
+    if math.isnan(lat) or math.isinf(lat) or not (-90.0 <= lat <= 90.0):
+        return jsonify({"error": "invalid_input", "message": "Latitude must be between -90 and 90"}), 400
+
+    if math.isnan(lng) or math.isinf(lng) or not (-180.0 <= lng <= 180.0):
+        return jsonify({"error": "invalid_input", "message": "Longitude must be between -180 and 180"}), 400
+
     new_ngo = NGO(
-        name=data.get('name'), phone=data.get('phone'),
-        address=data.get('address'), lat=data.get('lat'), lng=data.get('lng')
+        name=name,
+        phone=phone,
+        address=address,
+        lat=lat,
+        lng=lng
     )
     db.session.add(new_ngo)
     db.session.commit()

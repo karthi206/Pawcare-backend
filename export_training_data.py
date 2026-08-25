@@ -16,15 +16,16 @@ from models import Case
 UPLOAD_FOLDER = "uploads"
 EXPORT_FOLDER = "export"
 
-with app.app_context():
-    # Only export cases that have been reviewed and validated by a veterinarian
-    reviewed_cases = Case.query.filter(Case.vet_confirmed_label.isnot(None)).all()
+def export_vet_data():
+    with app.app_context():
+        # Only export cases that have been reviewed and validated by a veterinarian
+        reviewed_cases = Case.query.filter(Case.vet_confirmed_label.isnot(None)).all()
 
-    if not reviewed_cases:
-        print("No vet-reviewed cases found yet. Nothing to export.")
-        exit(0)
+        if not reviewed_cases:
+            print("No vet-reviewed cases found yet. Nothing to export.")
+            return {"exported": 0, "status": "no_data"}
 
-    os.makedirs(EXPORT_FOLDER, exist_ok=True)
+        os.makedirs(EXPORT_FOLDER, exist_ok=True)
 
     corrections = 0
     confirmations = 0

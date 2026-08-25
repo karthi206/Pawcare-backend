@@ -1,6 +1,5 @@
 import os
 from collections import defaultdict
-
 DATA_DIR = '../data'
 filename_locations = defaultdict(list)
 
