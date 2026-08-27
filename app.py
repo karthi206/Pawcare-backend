@@ -56,7 +56,8 @@ if os.path.isfile(ENV_PATH):
     except Exception as env_err:
         print(f"[startup] Notice reading .env: {env_err}")
 
-from cnn_model import load_model, predict_image, load_general_model, is_likely_dog
+from cnn_model import load_model, predict_image, load_general_model, is_likely_dog, load_ood_reference
+
 import cloudinary
 import cloudinary.uploader
 
@@ -224,12 +225,19 @@ def validate_image_file(file_storage):
 
 
 # Load ONNX models with absolute path resolution
-MODEL_PATH = os.path.join(MODEL_DIR, 'pawcare_model.onnx')
+# UPDATED: points to the ML v2 dual-output model (logits + pooled features),
+# needed for Mahalanobis OOD detection. Replaces the old single-output
+# pawcare_model.onnx. See PawCare ML v2 roadmap Step 13/14.
+MODEL_PATH = os.path.join(MODEL_DIR, 'pawcare_mobilenetv2_with_features.onnx')
 GENERAL_MODEL_PATH = os.path.join(MODEL_DIR, 'general_imagenet_model.onnx')
+CLASS_MEANS_PATH = os.path.join(MODEL_DIR, 'class_means.npy')
+COV_INV_PATH = os.path.join(MODEL_DIR, 'cov_inv.npy')
 
 model = load_model(MODEL_PATH)
 general_model = load_general_model(GENERAL_MODEL_PATH)
-CONFIDENCE_THRESHOLD = float(os.environ.get('AI_CONFIDENCE_THRESHOLD', '0.65'))
+class_means, cov_inv = load_ood_reference(CLASS_MEANS_PATH, COV_INV_PATH)
+# CONFIDENCE_THRESHOLD is now applied inside predict_image() (defaults to
+# the data-justified 0.7 from cnn_model.py); no longer computed here.
 
 
 with app.app_context():
@@ -252,6 +260,26 @@ with app.app_context():
             try:
                 conn.execute(db.text('ALTER TABLE "case" ADD COLUMN vet_confirmed_label VARCHAR(100)'))
                 conn.commit()
+            except Exception:
+                pass
+            # NEW: prediction/confidence must now allow NULL — predict_image()
+            # returns prediction=None (and confidence=None for OOD cases) for
+            # the "not_recognized" and "unable_to_classify" statuses added in
+            # ML v2 Step 10. Existing tables created before this change still
+            # have the old NOT NULL constraint baked in, so it must be
+            # dropped explicitly; db.create_all() never alters existing
+            # tables. Postgres-only syntax (matches DATABASE_URL in
+            # production); harmlessly no-ops on SQLite via the except below.
+            try:
+                conn.execute(db.text('ALTER TABLE "case" ALTER COLUMN prediction DROP NOT NULL'))
+                conn.commit()
+                print("[startup] Made case.prediction nullable.")
+            except Exception:
+                pass
+            try:
+                conn.execute(db.text('ALTER TABLE "case" ALTER COLUMN confidence DROP NOT NULL'))
+                conn.commit()
+                print("[startup] Made case.confidence nullable.")
             except Exception:
                 pass
     except Exception as mig_err:
@@ -361,8 +389,20 @@ def upload():
 
         # Run prediction on the local temp file
         location = request.form.get('location')
-        result = predict_image(model, temp_filepath, use_tta=False)
-        is_uncertain = result["confidence"] < CONFIDENCE_THRESHOLD
+        result = predict_image(model, temp_filepath, class_means, cov_inv, use_tta=False)
+
+        # predict_image() now returns one of three statuses:
+        #   "not_recognized"     -> image isn't a dog skin photo at all (OOD)
+        #   "unable_to_classify" -> low-confidence prediction, rejected
+        #   "possible_condition" -> confident, calibrated prediction
+        if result["status"] == "not_recognized":
+            return jsonify({
+                "error": "not_recognized",
+                "message": result["message"],
+                "ood_distance": result["ood_distance"],
+            }), 422
+
+        is_uncertain = result["status"] == "unable_to_classify"
 
         case_id = None
         # Save case and upload to Cloudinary (Cloudinary-only storage, no local disk fallback)
@@ -414,16 +454,13 @@ def upload():
         return jsonify({
             "case_id": case_id,
             "prediction": result["prediction"],
-            "confidence": round(result["confidence"], 3),
+            "confidence": round(result["confidence"], 3) if result["confidence"] is not None else None,
             "is_uncertain": is_uncertain,
             "is_ambiguous": result["is_ambiguous"],
             "second_prediction": result["second_prediction"],
             "second_confidence": round(result["second_confidence"], 3) if result["second_confidence"] else None,
-            "message": (
-                "Low confidence — recommend in-person veterinary examination."
-                if is_uncertain else
-                "AI analysis complete."
-            )
+            "ood_distance": result["ood_distance"],
+            "message": result["message"],
         })
     except Exception as inference_err:
         print(f"[upload] Error during inference/processing: {inference_err}")

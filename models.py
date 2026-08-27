@@ -7,8 +7,14 @@ db = SQLAlchemy()
 class Case(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     filename = db.Column(db.String(255), nullable=False)
-    prediction = db.Column(db.String(100), nullable=False)
-    confidence = db.Column(db.Float, nullable=False)
+    # NULLABLE: predict_image() now returns prediction=None for the
+    # "not_recognized" (OOD) and "unable_to_classify" (low-confidence)
+    # statuses, so this can no longer be NOT NULL. See PawCare ML v2
+    # roadmap Step 14.
+    prediction = db.Column(db.String(100), nullable=True)
+    # NULLABLE: confidence is also None for "not_recognized" cases,
+    # where the classifier's output isn't trusted at all.
+    confidence = db.Column(db.Float, nullable=True)
     is_uncertain = db.Column(db.Boolean, default=False)
     status = db.Column(db.String(50), default="pending")
     location = db.Column(db.String(255), nullable=True)

@@ -21,19 +21,31 @@ CLASS_NAMES = [
 # ImageNet dog-breed class indices used by the general model.
 DOG_CLASS_RANGE = range(151, 269)
 
-# Dog-gate threshold.
-#
-# 0.05 is the currently tested value that allows the project's
-# current valid dog images to pass the gate.
-#
-# Keep this configurable so it can be tuned without changing code.
 DOG_CONFIDENCE_THRESHOLD = float(
     os.environ.get("DOG_GATE_THRESHOLD", "0.05")
 )
 
-# Temperature used for disease-model probability calibration.
+# --- Calibration & rejection settings ---
+# These are the values actually fitted/validated in the ML v2 Colab notebook,
+# not placeholders. See PawCare ML v2 roadmap Steps 8-10.
+#
+# Temperature: fit via LBFGS on validation-set logits (NLL 0.2309 -> 0.1893)
 CALIBRATION_TEMPERATURE = float(
-    os.environ.get("AI_CALIBRATION_TEMPERATURE", "1.2")
+    os.environ.get("AI_CALIBRATION_TEMPERATURE", "1.5525")
+)
+
+# Confidence threshold: chosen from test-set data — below this, accuracy was
+# only ~75%; at/above it, accuracy was 98%+.
+CONFIDENCE_THRESHOLD = float(
+    os.environ.get("AI_CONFIDENCE_THRESHOLD", "0.7")
+)
+
+# OOD (out-of-distribution) threshold: Mahalanobis distance in the model's
+# pooled 1280-dim feature space. Full test-set distances ranged 21.42-80.56
+# (99th percentile 74.47); random noise scored 82-88. Set just above the
+# 99th percentile of real images and below the observed test-set max.
+OOD_THRESHOLD = float(
+    os.environ.get("AI_OOD_THRESHOLD", "75.0")
 )
 
 # ImageNet normalization.
@@ -55,6 +67,10 @@ STD = np.array(
 def load_model(weights_path):
     """
     Load the ONNX disease-detection model.
+
+    This model has TWO outputs: 'logits' (classification logits, shape
+    [1, 6]) and 'features' (pooled penultimate-layer features, shape
+    [1, 1280]) used for out-of-distribution detection.
     """
 
     if not os.path.exists(weights_path):
@@ -84,6 +100,29 @@ def load_general_model(
         weights_path,
         providers=["CPUExecutionProvider"],
     )
+
+
+def load_ood_reference(
+    class_means_path="model/class_means.npy",
+    cov_inv_path="model/cov_inv.npy",
+):
+    """
+    Load the per-class feature means and inverse covariance matrix used
+    for Mahalanobis-distance out-of-distribution detection.
+    """
+
+    if not os.path.exists(class_means_path):
+        raise FileNotFoundError(
+            f"OOD class means not found: {class_means_path}"
+        )
+    if not os.path.exists(cov_inv_path):
+        raise FileNotFoundError(
+            f"OOD covariance inverse not found: {cov_inv_path}"
+        )
+
+    class_means = np.load(class_means_path)
+    cov_inv = np.load(cov_inv_path)
+    return class_means, cov_inv
 
 
 # ============================================================
@@ -179,6 +218,33 @@ def _softmax(logits, temperature=1.0):
 
 
 # ============================================================
+# OUT-OF-DISTRIBUTION (OOD) DETECTION
+# ============================================================
+
+def _mahalanobis_distance(feature_vector, mean_vector, cov_inv):
+    """
+    Mahalanobis distance between a feature vector and a class mean,
+    given the shared inverse covariance matrix.
+    """
+    diff = feature_vector - mean_vector
+    return float(np.sqrt(diff @ cov_inv @ diff.T))
+
+
+def compute_ood_distance(feature_vector, class_means, cov_inv):
+    """
+    Minimum Mahalanobis distance from the given feature vector to any of
+    the six trained class means. Large values indicate the image's
+    features fall far outside anything seen during training — e.g. it
+    is not actually a dog skin photo at all.
+    """
+    distances = [
+        _mahalanobis_distance(feature_vector, class_means[c], cov_inv)
+        for c in range(class_means.shape[0])
+    ]
+    return min(distances)
+
+
+# ============================================================
 # DOG VALIDATION GATE
 # ============================================================
 
@@ -210,8 +276,6 @@ def is_likely_dog(
 
     input_array = _preprocess(image_path)
 
-    # Verify the model's expected input name instead of assuming
-    # it is always "input".
     input_name = general_model.get_inputs()[0].name
 
     outputs = general_model.run(
@@ -219,7 +283,6 @@ def is_likely_dog(
         {input_name: input_array},
     )[0]
 
-    # Remove unnecessary batch dimensions safely.
     logits = np.asarray(outputs).squeeze()
 
     probabilities = _softmax(
@@ -227,8 +290,6 @@ def is_likely_dog(
         temperature=1.0,
     )
 
-    # Make sure the model output is large enough for the
-    # configured ImageNet dog-class range.
     if len(probabilities) < 269:
         raise ValueError(
             "General model output does not contain enough "
@@ -260,18 +321,15 @@ def is_likely_dog(
         for index in top_k_indices
     )
 
-    # Rule 1: top-1 dog breed.
     if top1_class in DOG_CLASS_RANGE:
         return True
 
-    # Rule 2: dog appears in top-k and threshold is reached.
     if (
         has_dog_in_top_k
         and dog_probability_mass >= min_mass
     ):
         return True
 
-    # Rule 3: cumulative dog probability reaches threshold.
     if dog_probability_mass >= min_mass:
         return True
 
@@ -285,19 +343,28 @@ def is_likely_dog(
 def predict_image(
     session,
     image_path,
+    class_means,
+    cov_inv,
     use_tta=False,
     temperature=CALIBRATION_TEMPERATURE,
+    confidence_threshold=CONFIDENCE_THRESHOLD,
+    ood_threshold=OOD_THRESHOLD,
 ):
     """
-    Run disease-detection inference.
+    Run disease-detection inference with calibrated confidence,
+    confidence-based rejection, and out-of-distribution detection.
 
-    Returns:
-        prediction
-        confidence
-        second_prediction
-        second_confidence
-        ambiguity information
-        all class probabilities
+    The model has two ONNX outputs: 'logits' (classification logits)
+    and 'features' (pooled penultimate-layer features used for OOD
+    detection). TTA mode averages probabilities and features across
+    augmented variants.
+
+    Returns a dict always containing a "status" key:
+        "not_recognized"     -> image's features are too far from
+                                 anything seen in training (OOD)
+        "unable_to_classify" -> recognized as plausible input, but
+                                 confidence is below the threshold
+        "possible_condition" -> confident, calibrated prediction
     """
 
     if not os.path.exists(image_path):
@@ -305,23 +372,20 @@ def predict_image(
             f"Image not found: {image_path}"
         )
 
-    # Get the ONNX model's actual input name.
     input_name = session.get_inputs()[0].name
+    output_names = [o.name for o in session.get_outputs()]
 
     if not use_tta:
 
-        input_array = _preprocess(
-            image_path
+        input_array = _preprocess(image_path)
+
+        logits, features = session.run(
+            output_names,
+            {input_name: input_array},
         )
 
-        logits = session.run(
-            None,
-            {input_name: input_array},
-        )[0]
-
-        logits = np.asarray(
-            logits
-        ).squeeze()
+        logits = np.asarray(logits).squeeze()
+        features = np.asarray(features).squeeze()
 
         probabilities = _softmax(
             logits,
@@ -337,50 +401,35 @@ def predict_image(
             variants = [
                 image,
                 ImageOps.mirror(image),
-                image.rotate(
-                    10,
-                    expand=False,
-                ),
-                image.rotate(
-                    -10,
-                    expand=False,
-                ),
+                image.rotate(10, expand=False),
+                image.rotate(-10, expand=False),
             ]
 
             all_probabilities = []
+            all_features = []
 
             for variant in variants:
 
-                input_array = (
-                    _preprocess_pil_image(
-                        variant
-                    )
+                input_array = _preprocess_pil_image(variant)
+
+                logits, features = session.run(
+                    output_names,
+                    {input_name: input_array},
                 )
 
-                logits = session.run(
-                    None,
-                    {
-                        input_name: input_array
-                    },
-                )[0]
-
-                logits = np.asarray(
-                    logits
-                ).squeeze()
+                logits = np.asarray(logits).squeeze()
+                features = np.asarray(features).squeeze()
 
                 variant_probabilities = _softmax(
                     logits,
                     temperature=temperature,
                 )
 
-                all_probabilities.append(
-                    variant_probabilities
-                )
+                all_probabilities.append(variant_probabilities)
+                all_features.append(features)
 
-            probabilities = np.mean(
-                all_probabilities,
-                axis=0,
-            )
+            probabilities = np.mean(all_probabilities, axis=0)
+            features = np.mean(all_features, axis=0)
 
     # --------------------------------------------------------
     # Validate model output
@@ -394,74 +443,82 @@ def predict_image(
         )
 
     # --------------------------------------------------------
+    # Out-of-distribution check — run BEFORE trusting the
+    # classifier's output at all.
+    # --------------------------------------------------------
+
+    ood_distance = compute_ood_distance(features, class_means, cov_inv)
+
+    if ood_distance > ood_threshold:
+        return {
+            "status": "not_recognized",
+            "prediction": None,
+            "confidence": None,
+            "ood_distance": round(ood_distance, 2),
+            "second_prediction": None,
+            "second_confidence": None,
+            "is_ambiguous": False,
+            "all_probabilities": None,
+            "message": (
+                "This image doesn't appear to be a dog skin photo. "
+                "Please upload a clear image of the affected area."
+            ),
+        }
+
+    # --------------------------------------------------------
     # Top-2 predictions
     # --------------------------------------------------------
 
-    top2_indices = np.argsort(
-        probabilities
-    )[::-1][:2]
+    top2_indices = np.argsort(probabilities)[::-1][:2]
 
-    top_prediction_index = int(
-        top2_indices[0]
-    )
+    top_prediction_index = int(top2_indices[0])
+    second_prediction_index = int(top2_indices[1])
 
-    second_prediction_index = int(
-        top2_indices[1]
-    )
+    top_prediction = CLASS_NAMES[top_prediction_index]
+    top_confidence = float(probabilities[top_prediction_index])
 
-    top_prediction = CLASS_NAMES[
-        top_prediction_index
-    ]
+    second_prediction = CLASS_NAMES[second_prediction_index]
+    second_confidence = float(probabilities[second_prediction_index])
 
-    top_confidence = float(
-        probabilities[
-            top_prediction_index
-        ]
-    )
+    is_ambiguous = (top_confidence - second_confidence) < 0.15
 
-    second_prediction = CLASS_NAMES[
-        second_prediction_index
-    ]
-
-    second_confidence = float(
-        probabilities[
-            second_prediction_index
-        ]
-    )
+    all_probabilities = {
+        CLASS_NAMES[index]: float(probabilities[index])
+        for index in range(len(CLASS_NAMES))
+    }
 
     # --------------------------------------------------------
-    # Ambiguity detection
+    # Confidence-based rejection
     # --------------------------------------------------------
 
-    is_ambiguous = (
-        top_confidence
-        - second_confidence
-    ) < 0.15
+    if top_confidence < confidence_threshold:
+        return {
+            "status": "unable_to_classify",
+            "prediction": None,
+            "confidence": top_confidence,
+            "ood_distance": round(ood_distance, 2),
+            "second_prediction": second_prediction if is_ambiguous else None,
+            "second_confidence": second_confidence if is_ambiguous else None,
+            "is_ambiguous": is_ambiguous,
+            "all_probabilities": all_probabilities,
+            "message": (
+                "Unable to classify with sufficient confidence. "
+                "Please consult a veterinarian for an accurate diagnosis."
+            ),
+        }
 
     return {
+        "status": "possible_condition",
         "prediction": top_prediction,
         "confidence": top_confidence,
-
-        "second_prediction": (
-            second_prediction
-            if is_ambiguous
-            else None
-        ),
-
-        "second_confidence": (
-            second_confidence
-            if is_ambiguous
-            else None
-        ),
-
+        "ood_distance": round(ood_distance, 2),
+        "second_prediction": second_prediction if is_ambiguous else None,
+        "second_confidence": second_confidence if is_ambiguous else None,
         "is_ambiguous": is_ambiguous,
-
-        "all_probabilities": {
-            CLASS_NAMES[index]: float(
-                probabilities[index]
-            )
-            for index in range(
-                len(CLASS_NAMES)
-            )
-        },
+        "all_probabilities": all_probabilities,
+        "message": (
+            f"Possible condition: {top_prediction}. This is a preliminary "
+            f"AI screening result, not a diagnosis — please consult a "
+            f"veterinarian to confirm."
+        ),
     }

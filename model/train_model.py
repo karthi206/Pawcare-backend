@@ -55,32 +55,91 @@ class DogDiseaseDataset(Dataset):
         return image, label
 
 
-def build_datasets(data_dir, train_ratio=0.8, seed=42):
-    np.random.seed(seed)
-    train_samples = []
-    val_samples = []
+# def build_datasets(data_dir, train_ratio=0.8, seed=42):
+#     np.random.seed(seed)
+#     train_samples = []
+#     val_samples = []
+# 
+#     for cls_name in CLASS_NAMES:
+#         cls_dir = os.path.join(data_dir, cls_name)
+#         if not os.path.isdir(cls_dir):
+#             continue
+# 
+#         images = [
+#             os.path.join(cls_dir, f)
+#             for f in os.listdir(cls_dir)
+#             if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
+#         ]
+#         np.random.shuffle(images)
+# 
+#         split_idx = int(len(images) * train_ratio)
+#         label_idx = CLASS_TO_IDX[cls_name]
+# 
+#         for p in images[:split_idx]:
+#             train_samples.append((p, label_idx))
+#         for p in images[split_idx:]:
+#             val_samples.append((p, label_idx))
+# 
+#     return train_samples, val_samples
 
-    for cls_name in CLASS_NAMES:
-        cls_dir = os.path.join(data_dir, cls_name)
-        if not os.path.isdir(cls_dir):
-            continue
+def build_datasets(data_dir):
+    """
+    Loads the predefined Kaggle train/valid/test splits.
 
-        images = [
-            os.path.join(cls_dir, f)
-            for f in os.listdir(cls_dir)
-            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
-        ]
-        np.random.shuffle(images)
+    Expected structure:
 
-        split_idx = int(len(images) * train_ratio)
-        label_idx = CLASS_TO_IDX[cls_name]
+    data/
+    ├── train/
+    │   ├── Dermatitis/
+    │   ├── Fungal_infections/
+    │   ├── Healthy/
+    │   ├── Hypersensitivity/
+    │   ├── demodicosis/
+    │   └── ringworm/
+    ├── valid/
+    │   └── ...
+    └── test/
+        └── ...
+    """
 
-        for p in images[:split_idx]:
-            train_samples.append((p, label_idx))
-        for p in images[split_idx:]:
-            val_samples.append((p, label_idx))
+    def load_split(split_name):
+        split_dir = os.path.join(data_dir, split_name)
 
-    return train_samples, val_samples
+        if not os.path.isdir(split_dir):
+            raise FileNotFoundError(
+                f"Dataset split not found: {split_dir}"
+            )
+
+        samples = []
+
+        for cls_name in CLASS_NAMES:
+            cls_dir = os.path.join(split_dir, cls_name)
+
+            if not os.path.isdir(cls_dir):
+                raise FileNotFoundError(
+                    f"Class directory not found: {cls_dir}"
+                )
+
+            images = [
+                os.path.join(cls_dir, f)
+                for f in os.listdir(cls_dir)
+                if f.lower().endswith(
+                    ('.jpg', '.jpeg', '.png', '.webp')
+                )
+            ]
+
+            label_idx = CLASS_TO_IDX[cls_name]
+
+            for image_path in images:
+                samples.append((image_path, label_idx))
+
+        return samples
+
+    train_samples = load_split("train")
+    val_samples = load_split("valid")
+    test_samples = load_split("test")
+
+    return train_samples, val_samples, test_samples
 
 
 def get_transforms():
@@ -146,8 +205,14 @@ def train_pipeline(num_epochs=15, batch_size=16, lr=0.0003):
         print(f"Error: Dataset directory {DATA_DIR} not found.")
         return
 
-    train_samples, val_samples = build_datasets(DATA_DIR)
-    print(f"Dataset summary: {len(train_samples)} training samples, {len(val_samples)} validation samples across {NUM_CLASSES} classes.")
+    train_samples, val_samples, test_samples = build_datasets(DATA_DIR)
+    print(
+    f"Dataset summary:\n"
+    f"  Train: {len(train_samples)} images\n"
+    f"  Validation: {len(val_samples)} images\n"
+    f"  Test: {len(test_samples)} images\n"
+    f"  Classes: {NUM_CLASSES}"
+)
 
     train_transform, val_transform = get_transforms()
     train_dataset = DogDiseaseDataset(train_samples, transform=train_transform)
@@ -236,4 +301,4 @@ def train_pipeline(num_epochs=15, batch_size=16, lr=0.0003):
 
 
 if __name__ == '__main__':
-    train_pipeline()
+    train_pipeline()
