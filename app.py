@@ -7,6 +7,7 @@ import math
 import json
 import urllib.request
 import urllib.parse
+import hashlib
 from flask_cors import CORS
 from clustering import detect_clusters
 from werkzeug.utils import secure_filename
@@ -1154,6 +1155,27 @@ def create_pet():
     db.session.add(new_pet)
     db.session.commit()
     return jsonify(new_pet.to_dict()), 201
+
+@app.route('/upload', methods=['POST'])
+def upload():
+    file = request.files['image']
+    file_bytes = file.read()
+    file.seek(0)  # reset pointer for Cloudinary upload if needed
+
+    image_hash = hashlib.sha256(file_bytes).hexdigest()
+
+    existing = Case.query.filter_by(image_hash=image_hash).first()
+    if existing:
+        # Reuse existing Cloudinary asset — no re-upload, no new storage cost
+        image_url = existing.image_url
+        cloudinary_public_id = existing.cloudinary_public_id
+    else:
+        upload_result = cloudinary.uploader.upload(file, folder="pawcare_cases")
+        image_url = upload_result['secure_url']
+        cloudinary_public_id = upload_result['public_id']
+
+    # continue with predict_image(), case creation, etc.
+    # when creating the new Case row, set case.image_hash = image_hash
 
 
 if __name__ == '__main__':

@@ -25,6 +25,7 @@ class Case(db.Model):
     # before this column existed (from the old public /upload) don't break —
     # they'll just show up as "unowned" and only visible to vets/admins.
     reported_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    image_hash = db.Column(db.String(64), index=True, nullable=True)
 
     def to_dict(self):
         return {
