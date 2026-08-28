@@ -263,6 +263,12 @@ with app.app_context():
                 conn.commit()
             except Exception:
                 pass
+            try:
+                conn.execute(db.text('ALTER TABLE "case" ADD COLUMN image_hash VARCHAR(64)'))
+                conn.commit()
+                print("[startup] Added missing image_hash column to case table.")
+            except Exception:
+                pass
             # NEW: prediction/confidence must now allow NULL — predict_image()
             # returns prediction=None (and confidence=None for OOD cases) for
             # the "not_recognized" and "unable_to_classify" statuses added in
@@ -478,7 +484,7 @@ def upload():
                 os.remove(temp_filepath)
             except Exception:
                 pass
-            
+
 @app.route('/uploads/<filename>', methods=['GET'])
 @app.route('/api/uploads/<filename>', methods=['GET'])
 def serve_upload(filename):
@@ -1161,26 +1167,7 @@ def create_pet():
     db.session.commit()
     return jsonify(new_pet.to_dict()), 201
 
-@app.route('/upload', methods=['POST'])
-def upload():
-    file = request.files['image']
-    file_bytes = file.read()
-    file.seek(0)  # reset pointer for Cloudinary upload if needed
 
-    image_hash = hashlib.sha256(file_bytes).hexdigest()
-
-    existing = Case.query.filter_by(image_hash=image_hash).first()
-    if existing:
-        # Reuse existing Cloudinary asset — no re-upload, no new storage cost
-        image_url = existing.image_url
-        cloudinary_public_id = existing.cloudinary_public_id
-    else:
-        upload_result = cloudinary.uploader.upload(file, folder="pawcare_cases")
-        image_url = upload_result['secure_url']
-        cloudinary_public_id = upload_result['public_id']
-
-    # continue with predict_image(), case creation, etc.
-    # when creating the new Case row, set case.image_hash = image_hash
 
 
 if __name__ == '__main__':
