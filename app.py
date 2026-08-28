@@ -363,7 +363,6 @@ def upload():
     if not user_id:
         return jsonify({"error": "unauthorized", "message": "Authentication required to upload images."}), 401
 
-
     if 'image' not in request.files:
         return jsonify({"error": "No image uploaded"}), 400
 
@@ -372,6 +371,12 @@ def upload():
     is_valid, error_message = validate_image_file(file)
     if not is_valid:
         return jsonify({"error": "invalid_image", "message": error_message}), 400
+
+    # Compute hash for dedup check before saving/uploading
+    file.stream.seek(0)
+    file_bytes = file.stream.read()
+    image_hash = hashlib.sha256(file_bytes).hexdigest()
+    file.stream.seek(0)
 
     # Save temporarily to disk for model inference
     original_filename = secure_filename(file.filename or 'upload.jpg')
@@ -392,10 +397,6 @@ def upload():
         location = request.form.get('location')
         result = predict_image(model, temp_filepath, class_means, cov_inv, use_tta=False)
 
-        # predict_image() now returns one of three statuses:
-        #   "not_recognized"     -> image isn't a dog skin photo at all (OOD)
-        #   "unable_to_classify" -> low-confidence prediction, rejected
-        #   "possible_condition" -> confident, calibrated prediction
         if result["status"] == "not_recognized":
             return jsonify({
                 "error": "not_recognized",
@@ -406,10 +407,14 @@ def upload():
         is_uncertain = result["status"] == "unable_to_classify"
 
         case_id = None
-        # Save case and upload to Cloudinary (Cloudinary-only storage, no local disk fallback)
         if user_id:
             image_url = None
-            if os.environ.get('CLOUDINARY_API_KEY') and os.environ.get('CLOUDINARY_CLOUD_NAME'):
+
+            # Check for existing upload with the same hash before hitting Cloudinary
+            existing_case = Case.query.filter_by(image_hash=image_hash).first()
+            if existing_case:
+                image_url = existing_case.filename
+            elif os.environ.get('CLOUDINARY_API_KEY') and os.environ.get('CLOUDINARY_CLOUD_NAME'):
                 try:
                     with open(temp_filepath, 'rb') as f:
                         upload_result = cloudinary.uploader.upload(
@@ -435,6 +440,7 @@ def upload():
 
                 new_case = Case(
                     filename=image_url,
+                    image_hash=image_hash,
                     prediction=result["prediction"],
                     confidence=result["confidence"],
                     is_uncertain=is_uncertain,
@@ -472,8 +478,7 @@ def upload():
                 os.remove(temp_filepath)
             except Exception:
                 pass
-
-
+            
 @app.route('/uploads/<filename>', methods=['GET'])
 @app.route('/api/uploads/<filename>', methods=['GET'])
 def serve_upload(filename):
