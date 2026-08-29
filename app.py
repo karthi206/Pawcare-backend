@@ -71,10 +71,13 @@ cloudinary.config(
 app = Flask(__name__)
 
 # CORS configuration
+# FIXED: was pointing at the old "pawcare-frontend-azure" Vercel URL, which
+# no longer exists after the project was deleted/recreated. Updated to the
+# current deployment: pawcare-frontend-five.vercel.app
 CORS(app, origins=[
     "http://127.0.0.1:5173",
     "http://localhost:5173",
-    "https://pawcare-frontend-azure.vercel.app"
+    "https://pawcare-frontend-five.vercel.app"
 ], supports_credentials=True)
 
 # Database configuration
@@ -82,6 +85,15 @@ database_url = os.environ.get('DATABASE_URL', 'sqlite:///cases.db')
 if database_url.startswith('postgres://'):
     database_url = database_url.replace('postgres://', 'postgresql://', 1)
 app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+# FIXED: Neon closes idle Postgres connections; without pool_pre_ping the
+# pooled SQLAlchemy connection goes stale and the next request throws
+# "SSL connection has been closed unexpectedly" instead of transparently
+# reconnecting. pool_recycle proactively refreshes connections before Neon's
+# idle timeout hits.
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,
+    'pool_recycle': 280,
+}
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(app)
 
