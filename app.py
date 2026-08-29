@@ -375,11 +375,12 @@ def home():
 
 @app.route('/upload', methods=['POST'])
 @app.route('/api/upload', methods=['POST'])
-@jwt_required()
+@jwt_required(optional=True)
 def upload():
+    # optional=True: guests can use disease detection too. Logged-in users
+    # still get their result saved as a Case (see "if user_id:" below);
+    # guests just get the prediction back without it being persisted.
     user_id = get_jwt_identity()
-    if not user_id:
-        return jsonify({"error": "unauthorized", "message": "Authentication required to upload images."}), 401
 
     if 'image' not in request.files:
         return jsonify({"error": "No image uploaded"}), 400
