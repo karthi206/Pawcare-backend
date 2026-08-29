@@ -510,12 +510,13 @@ def serve_upload(filename):
 
 @app.route('/cases', methods=['GET'])
 @app.route('/api/cases', methods=['GET'])
-@jwt_required(optional=True)
+@jwt_required()
 def get_cases():
     user = get_current_user_obj()
     if not user:
-        cases = Case.query.order_by(Case.created_at.desc()).all()
-    elif user.role in ('vet', 'admin'):
+        return jsonify({"error": "unauthorized", "message": "Authentication required."}), 401
+
+    if user.role in ('vet', 'admin'):
         cases = Case.query.order_by(Case.created_at.desc()).all()
     else:
         cases = Case.query.filter_by(reported_by_id=user.id).order_by(Case.created_at.desc()).all()
@@ -525,14 +526,17 @@ def get_cases():
 
 @app.route('/cases/<int:case_id>', methods=['GET'])
 @app.route('/api/cases/<int:case_id>', methods=['GET'])
-@jwt_required(optional=True)
+@jwt_required()
 def get_case(case_id):
     user = get_current_user_obj()
+    if not user:
+        return jsonify({"error": "unauthorized", "message": "Authentication required."}), 401
+
     case = db.session.get(Case, case_id)
     if not case:
         return jsonify({"error": "Case not found"}), 404
 
-    if user and user.role not in ('vet', 'admin') and case.reported_by_id != user.id:
+    if user.role not in ('vet', 'admin') and case.reported_by_id != user.id:
         return jsonify({"error": "You don't have access to this case"}), 403
 
     return jsonify(case.to_dict())
