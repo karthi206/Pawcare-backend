@@ -37,6 +37,9 @@ from models import db, Case, User, NGO, NGONotification, Pet, AdoptionRequest
 from datetime import datetime, timedelta
 from PIL import Image
 
+from email_service import send_vet_registration_email
+from email_service import send_vet_decision_email
+
 # Dynamic absolute directory paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, 'model')
@@ -578,9 +581,15 @@ def register():
         new_user.clinic_name = data.get('clinic_name')
         new_user.clinic_address = data.get('clinic_address')
         new_user.is_verified = False
+    
 
     db.session.add(new_user)
     db.session.commit()
+    from email_service import send_vet_registration_email
+
+# after successful commit
+    if new_user.role == "vet":
+        send_vet_registration_email(new_user)
 
     return jsonify({
         "message": "Registered successfully" if role == 'user' else "Registered — awaiting admin verification before you can review cases",
@@ -709,6 +718,7 @@ def approve_vet(vet_id):
     vet.is_verified = True
     db.session.commit()
     return jsonify({"message": f"{vet.username} approved", "user": vet.to_dict()})
+    send_vet_decision_email(vet, approved=True)
 
 
 @app.route('/admin/vets/<int:vet_id>/reject', methods=['POST'])
@@ -727,6 +737,7 @@ def reject_vet(vet_id):
     vet.is_verified = False
     db.session.commit()
     return jsonify({"message": f"{vet.username}'s vet application was rejected. Their account remains active as a regular user."})
+    send_vet_decision_email(vet, approved=False)
 
 
 @app.route('/admin/export-corrections', methods=['GET'])
