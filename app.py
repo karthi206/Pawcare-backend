@@ -10,6 +10,8 @@ import urllib.parse
 import hashlib
 from flask_cors import CORS
 from clustering import detect_clusters
+import requests
+
 from werkzeug.utils import secure_filename
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity,
@@ -255,6 +257,81 @@ class_means, cov_inv = load_ood_reference(CLASS_MEANS_PATH, COV_INV_PATH)
 # CONFIDENCE_THRESHOLD is now applied inside predict_image() (defaults to
 # the data-justified 0.7 from cnn_model.py); no longer computed here.
 
+GEOCODE_CACHE = {}
+GEOCODE_CACHE_TTL = timedelta(hours=6)
+MAX_GEOCODE_CACHE_ENTRIES = 500
+
+
+def resolve_coordinates_to_address(lat: float, lng: float) -> str | None:
+    """Reverse geocodes (lat, lng) to a clean human-readable wording address with caching and fallbacks."""
+    cache_key = (round(lat, 4), round(lng, 4))
+    now = datetime.utcnow()
+    if cache_key in GEOCODE_CACHE:
+        cached_time, cached_address = GEOCODE_CACHE[cache_key]
+        if now - cached_time < GEOCODE_CACHE_TTL and cached_address:
+            return cached_address
+
+    address = None
+    # 1. OpenStreetMap Nominatim with structured address formatting
+    try:
+        url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lng}&zoom=18&addressdetails=1"
+        req = urllib.request.Request(url, headers={"User-Agent": "PawCareAI/1.0 (animal-welfare-locator)"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            addr = data.get("address", {})
+            parts = []
+            road = addr.get("road") or addr.get("pedestrian")
+            neighborhood = addr.get("neighbourhood") or addr.get("suburb") or addr.get("residential")
+            if road:
+                parts.append(road)
+            if neighborhood and neighborhood not in parts:
+                parts.append(neighborhood)
+            city = addr.get("city") or addr.get("town") or addr.get("village") or addr.get("county") or addr.get("city_district")
+            if city:
+                city_clean = city.replace(" Corporation", "").replace(" District", "")
+                if city_clean not in parts:
+                    parts.append(city_clean)
+            state = addr.get("state")
+            if state and state not in parts:
+                parts.append(state)
+
+            if parts:
+                address = ", ".join(parts)
+            elif data.get("display_name"):
+                address = data.get("display_name")
+    except Exception as exc:
+        print(f"[resolve_coordinates_to_address] Nominatim notice: {exc}")
+
+    # 2. BigDataCloud fallback if Nominatim is unavailable or rate-limited
+    if not address:
+        try:
+            url = f"https://api.bigdatacloud.net/data/reverse-geocode-client?latitude={lat}&longitude={lng}&localityLanguage=en"
+            req = urllib.request.Request(url, headers={"User-Agent": "PawCareAI/1.0 (animal-welfare-locator)"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                bdc_data = json.loads(resp.read().decode("utf-8"))
+                bdc_parts = []
+                locality = bdc_data.get("locality")
+                city = bdc_data.get("city")
+                subdivision = bdc_data.get("principalSubdivision")
+                if locality:
+                    bdc_parts.append(locality)
+                if city and city not in bdc_parts:
+                    bdc_parts.append(city)
+                if subdivision and subdivision not in bdc_parts:
+                    bdc_parts.append(subdivision)
+                if bdc_parts:
+                    address = ", ".join(bdc_parts)
+        except Exception as bdc_exc:
+            print(f"[resolve_coordinates_to_address] BigDataCloud notice: {bdc_exc}")
+
+    if address:
+        if len(GEOCODE_CACHE) >= MAX_GEOCODE_CACHE_ENTRIES:
+            for k in list(GEOCODE_CACHE.keys())[:100]:
+                GEOCODE_CACHE.pop(k, None)
+        GEOCODE_CACHE[cache_key] = (now, address)
+
+    return address
+
 
 with app.app_context():
     db.create_all()
@@ -284,6 +361,18 @@ with app.app_context():
                 print("[startup] Added missing image_hash column to case table.")
             except Exception:
                 pass
+            try:
+                conn.execute(db.text('ALTER TABLE "case" ADD COLUMN latitude FLOAT'))
+                conn.commit()
+                print("[startup] Added missing latitude column to case table.")
+            except Exception:
+                pass
+            try:
+                conn.execute(db.text('ALTER TABLE "case" ADD COLUMN longitude FLOAT'))
+                conn.commit()
+                print("[startup] Added missing longitude column to case table.")
+            except Exception:
+                pass
             # NEW: prediction/confidence must now allow NULL — predict_image()
             # returns prediction=None (and confidence=None for OOD cases) for
             # the "not_recognized" and "unable_to_classify" statuses added in
@@ -306,6 +395,34 @@ with app.app_context():
                 pass
     except Exception as mig_err:
         print(f"[startup] Migration notice: {mig_err}")
+
+    # Data migration: convert any lat/long coordinates stored in case.location to readable wording addresses
+    try:
+        raw_cases = Case.query.filter(Case.location.isnot(None)).all()
+        migrated_count = 0
+        for c in raw_cases:
+            if c.location:
+                parts = c.location.split(',')
+                if len(parts) == 2:
+                    try:
+                        p_lat = float(parts[0].strip())
+                        p_lng = float(parts[1].strip())
+                        if -90.0 <= p_lat <= 90.0 and -180.0 <= p_lng <= 180.0:
+                            if c.latitude is None:
+                                c.latitude = p_lat
+                            if c.longitude is None:
+                                c.longitude = p_lng
+                            wording = resolve_coordinates_to_address(p_lat, p_lng)
+                            if wording:
+                                c.location = wording
+                                migrated_count += 1
+                    except (ValueError, TypeError):
+                        pass
+        if migrated_count > 0:
+            db.session.commit()
+            print(f"[startup] Migrated {migrated_count} case(s) from lat/long to wording addresses.")
+    except Exception as mig_data_err:
+        print(f"[startup] Location wording migration notice: {mig_data_err}")
 
     # Admin Auto-Seed
     FIXED_ADMIN_USERNAME = os.environ.get('FIXED_ADMIN_USERNAME', 'admin')
@@ -415,8 +532,39 @@ def upload():
                 "message": "This doesn't appear to be a photo of a dog. Please upload a clear photo of the affected area."
             }), 422
 
-        # Run prediction on the local temp file
-        location = request.form.get('location')
+        # Parse location, latitude, and longitude
+        location = (request.form.get('location') or '').strip() or None
+        lat_raw = request.form.get('latitude')
+        lng_raw = request.form.get('longitude')
+        case_lat = None
+        case_lng = None
+        if lat_raw and lng_raw:
+            try:
+                case_lat = float(lat_raw)
+                case_lng = float(lng_raw)
+            except (ValueError, TypeError):
+                pass
+
+        # If coordinates were not passed explicitly, check if location was provided as "lat, lng"
+        if (case_lat is None or case_lng is None) and location:
+            parts = location.split(',')
+            if len(parts) == 2:
+                try:
+                    parsed_lat = float(parts[0].strip())
+                    parsed_lng = float(parts[1].strip())
+                    if -90.0 <= parsed_lat <= 90.0 and -180.0 <= parsed_lng <= 180.0:
+                        case_lat = parsed_lat
+                        case_lng = parsed_lng
+                        wording_addr = resolve_coordinates_to_address(case_lat, case_lng)
+                        if wording_addr:
+                            location = wording_addr
+                except (ValueError, TypeError):
+                    pass
+
+        # If location was not provided but coordinates exist, resolve to a wording address
+        if not location and case_lat is not None and case_lng is not None:
+            location = resolve_coordinates_to_address(case_lat, case_lng)
+
         result = predict_image(model, temp_filepath, class_means, cov_inv, use_tta=False)
 
         if result["status"] == "not_recognized":
@@ -467,6 +615,8 @@ def upload():
                     confidence=result["confidence"],
                     is_uncertain=is_uncertain,
                     location=location,
+                    latitude=case_lat,
+                    longitude=case_lng,
                     reported_by_id=reported_id,
                 )
                 db.session.add(new_case)
@@ -552,6 +702,11 @@ def get_clusters():
     all_cases = Case.query.all()
     cases_as_dicts = [c.to_dict() for c in all_cases]
     clusters = detect_clusters(cases_as_dicts)
+    for cl in clusters:
+        if not cl.get("location_name") and cl.get("center_lat") and cl.get("center_lon"):
+            resolved = resolve_coordinates_to_address(cl["center_lat"], cl["center_lon"])
+            if resolved:
+                cl["location_name"] = resolved
     return jsonify(clusters)
 
 
@@ -1194,8 +1349,31 @@ def create_pet():
     db.session.add(new_pet)
     db.session.commit()
     return jsonify(new_pet.to_dict()), 201
+@app.route('/geocode/reverse', methods=['GET'])
+@app.route('/api/geocode/reverse', methods=['GET'])
+def reverse_geocode():
+    lat_raw = request.args.get('lat')
+    lng_raw = request.args.get('lng')
 
+    if lat_raw is None or lng_raw is None:
+        return jsonify({"error": "invalid_parameters", "message": "lat and lng are required"}), 400
 
+    try:
+        lat = float(lat_raw)
+        lng = float(lng_raw)
+    except (ValueError, TypeError):
+        return jsonify({"error": "invalid_parameters", "message": "lat and lng must be valid numbers"}), 400
+
+    if math.isnan(lat) or math.isinf(lat) or not (-90.0 <= lat <= 90.0) or \
+       math.isnan(lng) or math.isinf(lng) or not (-180.0 <= lng <= 180.0):
+        return jsonify({"error": "invalid_parameters", "message": "lat/lng out of range"}), 400
+
+    address = resolve_coordinates_to_address(lat, lng)
+
+    if not address:
+        return jsonify({"address": None, "message": "Could not resolve address"}), 200
+
+    return jsonify({"address": address})
 
 
 if __name__ == '__main__':

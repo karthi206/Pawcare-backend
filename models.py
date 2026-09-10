@@ -18,6 +18,8 @@ class Case(db.Model):
     is_uncertain = db.Column(db.Boolean, default=False)
     status = db.Column(db.String(50), default="pending")
     location = db.Column(db.String(255), nullable=True)
+    latitude = db.Column(db.Float, nullable=True)
+    longitude = db.Column(db.Float, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     vet_confirmed_label = db.Column(db.String(100), nullable=True)
     reviewed_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
@@ -36,6 +38,8 @@ class Case(db.Model):
             "is_uncertain": self.is_uncertain,
             "status": self.status,
             "location": self.location,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
             "created_at": self.created_at.isoformat(),
             "vet_confirmed_label": self.vet_confirmed_label,
             "reported_by_id": self.reported_by_id,

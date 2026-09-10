@@ -102,7 +102,18 @@ def detect_clusters(cases, radius_km=RADIUS_KM, time_window_days=TIME_WINDOW_DAY
     # Build enriched, filtered records: valid location, recent, real disease label
     points = []
     for case in cases:
-        coords = _parse_location(case.get('location'))
+        coords = None
+        lat_val = case.get('latitude')
+        lng_val = case.get('longitude')
+        if lat_val is not None and lng_val is not None:
+            try:
+                coords = (float(lat_val), float(lng_val))
+            except (ValueError, TypeError):
+                coords = None
+
+        if coords is None:
+            coords = _parse_location(case.get('location'))
+
         if coords is None:
             continue
 
@@ -114,6 +125,9 @@ def detect_clusters(cases, radius_km=RADIUS_KM, time_window_days=TIME_WINDOW_DAY
         if not label or label in EXCLUDED_LABELS:
             continue
 
+        loc_str = case.get('location')
+        loc_name = loc_str if (loc_str and _parse_location(loc_str) is None) else None
+
         points.append({
             'id': case.get('id'),
             'lat': coords[0],
@@ -121,6 +135,7 @@ def detect_clusters(cases, radius_km=RADIUS_KM, time_window_days=TIME_WINDOW_DAY
             'label': label,
             'weight': weight,
             'is_vet_confirmed': bool(case.get('vet_confirmed_label')),
+            'location_name': loc_name,
         })
 
     clusters = []
@@ -162,12 +177,20 @@ def detect_clusters(cases, radius_km=RADIUS_KM, time_window_days=TIME_WINDOW_DAY
             title = f"Confirmed {label} Outbreak" if is_confirmed else f"Possible {label} Cluster"
             confidence_level = "high" if is_confirmed else ("moderate" if weighted_score >= 2.5 else "low")
 
+            # Extract human-readable wording address from member cases if available
+            cluster_location_name = None
+            for p in group:
+                if p.get('location_name'):
+                    cluster_location_name = p['location_name']
+                    break
+
             clusters.append({
                 "disease": label,
                 "case_count": len(group),
                 "case_ids": [p['id'] for p in group],
                 "center_lat": center_lat,
                 "center_lon": center_lon,
+                "location_name": cluster_location_name,
                 "weighted_score": round(weighted_score, 2),
                 "vet_confirmed_count": vet_confirmed_count,
                 "cluster_type": cluster_type,
