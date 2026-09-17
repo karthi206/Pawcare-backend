@@ -344,35 +344,35 @@ with app.app_context():
                 conn.commit()
                 print("[startup] Added missing reported_by_id column to case table.")
             except Exception:
-                pass
+                conn.rollback()
             try:
                 conn.execute(db.text('ALTER TABLE "case" ADD COLUMN reviewed_by_id INTEGER REFERENCES "user"(id)'))
                 conn.commit()
             except Exception:
-                pass
+                conn.rollback()
             try:
                 conn.execute(db.text('ALTER TABLE "case" ADD COLUMN vet_confirmed_label VARCHAR(100)'))
                 conn.commit()
             except Exception:
-                pass
+                conn.rollback()
             try:
                 conn.execute(db.text('ALTER TABLE "case" ADD COLUMN image_hash VARCHAR(64)'))
                 conn.commit()
                 print("[startup] Added missing image_hash column to case table.")
             except Exception:
-                pass
+                conn.rollback()
             try:
                 conn.execute(db.text('ALTER TABLE "case" ADD COLUMN latitude FLOAT'))
                 conn.commit()
                 print("[startup] Added missing latitude column to case table.")
             except Exception:
-                pass
+                conn.rollback()
             try:
                 conn.execute(db.text('ALTER TABLE "case" ADD COLUMN longitude FLOAT'))
                 conn.commit()
                 print("[startup] Added missing longitude column to case table.")
             except Exception:
-                pass
+                conn.rollback()
             # NEW: prediction/confidence must now allow NULL — predict_image()
             # returns prediction=None (and confidence=None for OOD cases) for
             # the "not_recognized" and "unable_to_classify" statuses added in
@@ -386,13 +386,13 @@ with app.app_context():
                 conn.commit()
                 print("[startup] Made case.prediction nullable.")
             except Exception:
-                pass
+                conn.rollback()
             try:
                 conn.execute(db.text('ALTER TABLE "case" ALTER COLUMN confidence DROP NOT NULL'))
                 conn.commit()
                 print("[startup] Made case.confidence nullable.")
             except Exception:
-                pass
+                conn.rollback()
     except Exception as mig_err:
         print(f"[startup] Migration notice: {mig_err}")
 
@@ -417,7 +417,7 @@ with app.app_context():
                                 c.location = wording
                                 migrated_count += 1
                     except (ValueError, TypeError):
-                        pass
+                        conn.rollback()
         if migrated_count > 0:
             db.session.commit()
             print(f"[startup] Migrated {migrated_count} case(s) from lat/long to wording addresses.")
