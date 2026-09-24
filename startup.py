@@ -44,14 +44,6 @@ def run_startup_migrations(db):
                 print("[startup] Added missing longitude column to case table.")
             except Exception:
                 conn.rollback()
-            # prediction/confidence must allow NULL — predict_image() returns
-            # prediction=None (and confidence=None for OOD cases) for the
-            # "not_recognized" and "unable_to_classify" statuses (ML v2 Step
-            # 10). Existing tables created before this change still have the
-            # old NOT NULL constraint, so it must be dropped explicitly;
-            # db.create_all() never alters existing tables. Postgres-only
-            # syntax (matches DATABASE_URL in production); harmlessly no-ops
-            # on SQLite via the except below.
             try:
                 conn.execute(db.text('ALTER TABLE "case" ALTER COLUMN prediction DROP NOT NULL'))
                 conn.commit()
@@ -62,6 +54,16 @@ def run_startup_migrations(db):
                 conn.execute(db.text('ALTER TABLE "case" ALTER COLUMN confidence DROP NOT NULL'))
                 conn.commit()
                 print("[startup] Made case.confidence nullable.")
+            except Exception:
+                conn.rollback()
+
+            # NEW: is_fixed_admin flag on user table, used by seed_fixed_admin()
+            # to find the permanent admin row by identity, not by username/email
+            # (which can change).
+            try:
+                conn.execute(db.text('ALTER TABLE "user" ADD COLUMN is_fixed_admin BOOLEAN DEFAULT FALSE'))
+                conn.commit()
+                print("[startup] Added missing is_fixed_admin column to user table.")
             except Exception:
                 conn.rollback()
 
@@ -98,7 +100,13 @@ def run_startup_migrations(db):
 
 
 def seed_fixed_admin(db):
-    """Create or sync the permanent admin account from environment config."""
+    """Create or sync the permanent admin account from environment config.
+
+    Matches the existing row by is_fixed_admin=True (a stable identity flag),
+    NOT by username/email — those can be changed via env vars, and matching
+    on them caused a new duplicate admin row to be created every time the
+    username or email changed instead of updating the original row.
+    """
     FIXED_ADMIN_USERNAME = os.environ.get('FIXED_ADMIN_USERNAME', 'admin')
     FIXED_ADMIN_PASSWORD = os.environ.get('FIXED_ADMIN_PASSWORD', 'admin123')
     FIXED_ADMIN_EMAIL = os.environ.get('FIXED_ADMIN_EMAIL', 'admin@pawcare.local')
@@ -107,15 +115,32 @@ def seed_fixed_admin(db):
         print("[startup] FIXED_ADMIN_USERNAME / FIXED_ADMIN_PASSWORD not set — skipping admin auto-seed.")
         return
 
-    existing_admin = User.query.filter(
-        (User.username == FIXED_ADMIN_USERNAME) | (User.email == FIXED_ADMIN_EMAIL)
-    ).first()
+    existing_admin = User.query.filter_by(is_fixed_admin=True).first()
+
     if not existing_admin:
+        # Fallback: also check by username/email in case an older row exists
+        # from before this flag was introduced, so we adopt it instead of
+        # creating yet another duplicate.
+        legacy_match = User.query.filter(
+            (User.username == FIXED_ADMIN_USERNAME) | (User.email == FIXED_ADMIN_EMAIL)
+        ).first()
+        if legacy_match:
+            legacy_match.username = FIXED_ADMIN_USERNAME
+            legacy_match.email = FIXED_ADMIN_EMAIL
+            legacy_match.role = 'admin'
+            legacy_match.is_verified = True
+            legacy_match.is_fixed_admin = True
+            legacy_match.set_password(FIXED_ADMIN_PASSWORD)
+            db.session.commit()
+            print(f"[startup] Adopted legacy admin row as permanent admin: {FIXED_ADMIN_USERNAME}")
+            return
+
         new_admin = User(
             username=FIXED_ADMIN_USERNAME,
             email=FIXED_ADMIN_EMAIL,
             role='admin',
             is_verified=True,
+            is_fixed_admin=True,
         )
         new_admin.set_password(FIXED_ADMIN_PASSWORD)
         db.session.add(new_admin)

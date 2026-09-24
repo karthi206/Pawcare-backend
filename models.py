@@ -51,6 +51,7 @@ class User(db.Model):
     email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
     role = db.Column(db.String(20), default="user")  # 'user', 'vet', or 'admin'
+    is_fixed_admin = db.Column(db.Boolean, default=False, nullable=False)
 
     # Vet-specific fields - only relevant when role='vet'
     license_number = db.Column(db.String(100), nullable=True)
