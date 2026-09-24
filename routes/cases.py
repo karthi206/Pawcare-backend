@@ -18,7 +18,7 @@ from helpers import get_current_user_obj, require_verified_vet_or_admin
 
 cases_bp = Blueprint('cases', __name__)
 
-
+@limiter.limit("20 per hour")
 @cases_bp.route('/upload', methods=['POST'])
 @cases_bp.route('/api/upload', methods=['POST'])
 @jwt_required(optional=True)

@@ -12,7 +12,7 @@ from flask_jwt_extended.exceptions import (
 )
 
 from config import Config, require_jwt_secret, UPLOAD_FOLDER
-from extensions import db, jwt
+from extensions import db, jwt, limiter
 
 # config.py loads .env as soon as it's imported (see the top of that file),
 # so by the time we get here Config's env-backed values are already correct.
@@ -33,6 +33,7 @@ CORS(app, origins=Config.CORS_ORIGINS, supports_credentials=True)
 
 db.init_app(app)
 jwt.init_app(app)
+limiter.init_app(app)
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 

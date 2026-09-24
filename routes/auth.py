@@ -7,6 +7,7 @@ from flask_jwt_extended import (
 from extensions import db
 from models import User
 from email_service import send_vet_registration_email
+from extensions import limiter
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -52,6 +53,8 @@ def register():
 
 @auth_bp.route('/auth/login', methods=['POST'])
 @auth_bp.route('/api/auth/login', methods=['POST'])
+@limiter.limit("5 per minute")   # above login
+@limiter.limit("10 per minute")  # above register
 def login():
     data = request.get_json(silent=True) or {}
     identifier = (data.get('username') or data.get('email') or '').strip()
@@ -212,3 +215,4 @@ def update_password():
     db.session.commit()
 
     return jsonify({"message": "Password updated successfully"}), 200
+
