@@ -15,6 +15,7 @@ from ml import model, general_model, class_means, cov_inv, predict_image, is_lik
 from utils.validation import validate_image_file
 from services.geocoding import resolve_coordinates_to_address
 from helpers import get_current_user_obj, require_verified_vet_or_admin
+from extensions import limiter
 
 cases_bp = Blueprint('cases', __name__)
 
