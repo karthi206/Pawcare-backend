@@ -19,10 +19,10 @@ from extensions import limiter
 
 cases_bp = Blueprint('cases', __name__)
 
-@limiter.limit("20 per hour")
 @cases_bp.route('/upload', methods=['POST'])
 @cases_bp.route('/api/upload', methods=['POST'])
 @jwt_required(optional=True)
+@limiter.limit("20 per hour")
 def upload():
     # optional=True: guests can use disease detection too. Logged-in users
     # still get their result saved as a Case (see "if user_id:" below);
