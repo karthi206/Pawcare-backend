@@ -84,6 +84,7 @@ class NGO(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(200), nullable=False)
     phone = db.Column(db.String(50), nullable=False)
+    email = db.Column(db.String(255), nullable=True)
     address = db.Column(db.String(300), nullable=False)
     lat = db.Column(db.Float, nullable=False)
     lng = db.Column(db.Float, nullable=False)

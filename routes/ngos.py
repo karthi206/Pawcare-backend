@@ -9,6 +9,7 @@ from models import NGO, NGONotification
 from utils.geo import haversine_distance
 from services.osm import get_live_nearby_places
 from helpers import require_admin
+from email_service import send_ngo_notification_email  
 
 ngos_bp = Blueprint('ngos', __name__)
 
@@ -153,6 +154,7 @@ def create_ngo():
     data = request.get_json(silent=True) or {}
     name = (data.get('name') or '').strip()
     phone = (data.get('phone') or '').strip()
+    email = (data.get('email') or '').strip() 
     address = (data.get('address') or '').strip()
     lat_raw = data.get('lat')
     lng_raw = data.get('lng')
@@ -179,7 +181,7 @@ def create_ngo():
     if math.isnan(lng) or math.isinf(lng) or not (-180.0 <= lng <= 180.0):
         return jsonify({"error": "invalid_input", "message": "Longitude must be between -180 and 180"}), 400
 
-    new_ngo = NGO(name=name, phone=phone, address=address, lat=lat, lng=lng)
+    new_ngo = NGO(name=name, phone=phone, email=email or None, address=address, lat=lat, lng=lng)
     db.session.add(new_ngo)
     db.session.commit()
     return jsonify(new_ngo.to_dict()), 201
@@ -214,7 +216,15 @@ def notify_ngo(ngo_id):
     if recent_notification:
         return jsonify({"error": "You've already notified this NGO recently. Please wait a few minutes before trying again."}), 429
 
+    # NEW:
     notification = NGONotification(ngo_id=ngo_id, user_id=int(user_id), message=message)
     db.session.add(notification)
     db.session.commit()
-    return jsonify({"message": f"{ngo.name} has been notified"}), 201
+
+    email_sent = send_ngo_notification_email(ngo, message)
+    if email_sent:
+        return jsonify({"message": f"{ngo.name} has been notified by email"}), 201
+    return jsonify({
+        "message": f"{ngo.name} logged, but no email is on file — please contact them directly.",
+        "email_sent": False
+    }), 201

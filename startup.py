@@ -67,6 +67,13 @@ def run_startup_migrations(db):
             except Exception:
                 conn.rollback()
 
+            try:
+                conn.execute(db.text('ALTER TABLE "ngo" ADD COLUMN email VARCHAR(255)'))
+                conn.commit()
+                print("[startup] Added missing email column to ngo table.")
+            except Exception:
+                conn.rollback()
+
             # Data migration: convert any lat/long coordinates stored in
             # case.location into readable wording addresses.
             try:

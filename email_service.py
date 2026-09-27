@@ -1,4 +1,5 @@
 import os
+import html
 import resend
 import logging
 
@@ -8,26 +9,30 @@ FROM_EMAIL = "PawCare <onboarding@resend.dev>"  # swap once domain verified
 
 logger = logging.getLogger(__name__)
 
-def send_vet_registration_email(vet):
+def send_ngo_notification_email(ngo, message: str) -> bool:
+    """Email an NGO about a reported case. Returns True if the send was
+    attempted successfully, False if skipped (no email on file) or failed."""
+    if not ngo.email:
+        logger.warning(f"NGO {ngo.id} ({ngo.name}) has no email on file — notification not sent.")
+        return False
     try:
+        safe_name = html.escape(ngo.name)
+        safe_message = html.escape(message)
         resend.Emails.send({
             "from": FROM_EMAIL,
-            "to": [ADMIN_EMAIL],
-            "subject": "New Vet Registration Pending Verification",
+            "to": [ngo.email],
+            "subject": "PawCare: A case near you needs attention",
             "html": f"""
-                <p>A new vet has registered and needs verification:</p>
-                <ul>
-                    <li>Name: {vet.username}</li>
-                    <li>Email: {vet.email}</li>
-                    <li>License #: {vet.license_number}</li>
-                    <li>Clinic: {vet.clinic_name}</li>
-                </ul>
-                <p>Review in the admin panel.</p>
+                <p>Hi {safe_name},</p>
+                <p>PawCare has a case that may need your attention:</p>
+                <p>{safe_message}</p>
+                <p>This message was sent by a PawCare admin via the notify feature.</p>
             """
         })
+        return True
     except Exception as e:
-        logger.error(f"Failed to send vet registration email: {e}")
-
+        logger.error(f"Failed to send NGO notification email to {ngo.email}: {e}")
+        return False
 
 def send_vet_decision_email(vet, approved: bool):
     try:
