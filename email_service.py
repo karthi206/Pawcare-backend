@@ -49,3 +49,22 @@ def send_vet_decision_email(vet, approved: bool):
         })
     except Exception as e:
         logger.error(f"Failed to send vet decision email: {e}")
+def send_vet_registration_email(vet):
+    try:
+        resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [ADMIN_EMAIL],
+            "subject": "New Vet Registration Pending Verification",
+            "html": f"""
+                <p>A new vet has registered and needs verification:</p>
+                <ul>
+                    <li>Name: {vet.username}</li>
+                    <li>Email: {vet.email}</li>
+                    <li>License #: {vet.license_number}</li>
+                    <li>Clinic: {vet.clinic_name}</li>
+                </ul>
+                <p>Review in the admin panel.</p>
+            """
+        })
+    except Exception as e:
+        logger.error(f"Failed to send vet registration email: {e}")
