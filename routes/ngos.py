@@ -10,6 +10,7 @@ from utils.geo import haversine_distance
 from services.osm import get_live_nearby_places
 from helpers import require_admin
 from email_service import send_ngo_notification_email  
+from sqlalchemy.exc import IntegrityError
 
 ngos_bp = Blueprint('ngos', __name__)
 
@@ -183,7 +184,12 @@ def create_ngo():
 
     new_ngo = NGO(name=name, phone=phone, email=email or None, address=address, lat=lat, lng=lng)
     db.session.add(new_ngo)
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"error": "conflict", "message": "An NGO with this name and address already exists"}), 409
+
     return jsonify(new_ngo.to_dict()), 201
 
 

@@ -1,4 +1,5 @@
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import UniqueConstraint
 from datetime import datetime
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -89,6 +90,7 @@ class NGO(db.Model):
     lat = db.Column(db.Float, nullable=False)
     lng = db.Column(db.Float, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("name", "address", name="uq_ngo_name_address"),)
 
     def to_dict(self):
         return {
